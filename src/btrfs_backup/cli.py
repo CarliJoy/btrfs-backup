@@ -68,6 +68,13 @@ LogFn = Callable[[str], None]
 DEFAULT_FILTER_FILE = Path("/etc/btrfs-backup.filter")
 LISTS_DIR = Path("/root/backup-lists")
 
+# The primary user is the one with this UID (the first normal user, UID 1000 on Ubuntu).
+# Its per-user exports (flatpak, uv tools) are saved and the default disk paths use its name.
+PRIMARY_UID = 1000
+MEDIA_DIR = Path("/media")
+LOCAL_ROOT_SUBPATH = "ssd-backup"  # default: /media/<USER>/ssd-backup
+REMOTE_ROOT_SUBPATH = "8tb/Backups/from-ssd"  # default: /media/<USER>/8tb/Backups/from-ssd
+
 # rsync exit codes that still count as a successful backup:
 # 0 = ok, 24 = "some source files vanished" (normal when copying a live system)
 RSYNC_VANISHED_CODE = 24
@@ -151,24 +158,25 @@ def run_pipe(send_cmd: Sequence[str], receive_cmd: Sequence[str]) -> None:
 
 
 def ensure_mounted_btrfs(path: Path) -> None:
-    """Refuse to continue unless `path` is a mountpoint of a btrfs filesystem.
+    """Refuse to continue unless `path` lies on a mounted btrfs filesystem.
 
-    This protects against writing a whole backup into the root filesystem
+    `path` may be the mountpoint or a directory below it (e.g. a folder on the backup
+    disk). This protects against writing a whole backup into the root filesystem
     because the backup disk was not mounted.
     """
     if not path.is_dir():
         raise click.ClickException(f"{path} does not exist.")
-    if not os.path.ismount(path):
-        raise click.ClickException(f"{path} is not a mountpoint. Mount the disk first.")
     result = subprocess.run(
-        ["findmnt", "-n", "-o", "FSTYPE", "--target", str(path)],
+        ["findmnt", "-n", "-o", "FSTYPE,TARGET", "--target", str(path)],
         capture_output=True,
         text=True,
         check=False,
     )
-    fstype = result.stdout.strip()
+    fstype, _, mountpoint = result.stdout.strip().partition(" ")
+    if mountpoint.strip() == "/":
+        raise click.ClickException(f"{path} is on the root filesystem. Mount the disk first.")
     if fstype != "btrfs":
-        raise click.ClickException(f"{path} is not a btrfs mount (found: {fstype!r}).")
+        raise click.ClickException(f"{path} is not on a btrfs mount (found: {fstype!r}).")
 
 
 def list_snapshots(snap_dir: Path) -> list[Path]:
@@ -245,8 +253,41 @@ def is_complete_subvolume(subvol: Path) -> bool:
     return False
 
 
-def save_package_lists(flatpak_user: str, log: LogFn) -> None:
-    """Write lists of installed packages/flatpaks into LISTS_DIR (part of the backup)."""
+def primary_user() -> str:
+    """Return the name of the user with UID ``PRIMARY_UID``."""
+    try:
+        return pwd.getpwuid(PRIMARY_UID).pw_name
+    except KeyError:
+        raise click.ClickException(
+            f"No user with UID {PRIMARY_UID} found, pass the paths and --primary-user."
+        ) from None
+
+
+def user_home(user: str) -> str:
+    """Return the home directory of ``user``."""
+    try:
+        return pwd.getpwnam(user).pw_dir
+    except KeyError:
+        raise click.ClickException(f"Unknown user: {user!r}") from None
+
+
+def default_local_root() -> Path:
+    """Default local backup disk: ``/media/<primary user>/ssd-backup``."""
+    return MEDIA_DIR / primary_user() / LOCAL_ROOT_SUBPATH
+
+
+def default_remote_root() -> Path:
+    """Default remote backup location: ``/media/<primary user>/8tb/Backups/from-ssd``."""
+    return MEDIA_DIR / primary_user() / REMOTE_ROOT_SUBPATH
+
+
+def save_package_lists(user: str, log: LogFn) -> None:
+    """Write lists of installed packages/flatpaks into LISTS_DIR (part of the backup).
+
+    Args:
+        user: The primary user, whose per-user flatpaks and uv tools are exported.
+        log: Logging function from ``start_log``.
+    """
     LISTS_DIR.mkdir(parents=True, exist_ok=True)
     jobs: list[tuple[str, list[str]]] = []
 
@@ -268,31 +309,19 @@ def save_package_lists(flatpak_user: str, log: LogFn) -> None:
                 ["flatpak", "remotes", "--system", "--columns=name,url"],
             )
         )
-        if flatpak_user:
-            try:
-                home = pwd.getpwnam(flatpak_user).pw_dir
-            except KeyError:
-                raise click.ClickException(f"Unknown user for flatpaks: {flatpak_user!r}") from None
-            as_user = ["runuser", "-u", flatpak_user, "--", "env", f"HOME={home}"]
-            jobs.append(
-                (
-                    "flatpak-user.txt",
-                    [
-                        *as_user,
-                        "flatpak",
-                        "list",
-                        "--user",
-                        "--app",
-                        "--columns=origin,application",
-                    ],
-                )
+        as_user = ["runuser", "-u", user, "--", "env", f"HOME={user_home(user)}"]
+        jobs.append(
+            (
+                "flatpak-user.txt",
+                [*as_user, "flatpak", "list", "--user", "--app", "--columns=origin,application"],
             )
-            jobs.append(
-                (
-                    "flatpak-remotes-user.txt",
-                    [*as_user, "flatpak", "remotes", "--user", "--columns=name,url"],
-                )
+        )
+        jobs.append(
+            (
+                "flatpak-remotes-user.txt",
+                [*as_user, "flatpak", "remotes", "--user", "--columns=name,url"],
             )
+        )
     else:
         log("flatpak not installed, skipping flatpak lists.")
 
@@ -426,6 +455,52 @@ def save_model_restore_scripts(extra_ollama_dirs: Iterable[Path], log: LogFn) ->
         log("No Hugging Face models found, skipping huggingface-restore.sh.")
 
 
+def uv_tool_install_lines(listing: str) -> list[str]:
+    """Turn the output of ``uv tool list --show-with`` into ``uv tool install`` commands.
+
+    A listing line looks like ``ruff v0.17.2 [with: rich>=13, click]``. Indented lines and
+    lines starting with ``-`` are the executables of a tool and are skipped.
+    """
+    marker = "[with: "
+    commands: list[str] = []
+    for line in listing.splitlines():
+        if not line.strip() or line.startswith(("-", " ")):
+            continue
+        args = ["uv", "tool", "install"]
+        if marker in line:
+            packages = line.split(marker, 1)[1].removesuffix("]")
+            for package in packages.split(", "):
+                args += ["--with", package]
+        args.append(line.split()[0])
+        commands.append(shlex.join(args))
+    return commands
+
+
+def save_uv_tools_script(user: str, log: LogFn) -> None:
+    """Write ``uv-tools-restore.sh``, which reinstalls the ``uv tool`` installs of ``user``."""
+    home = user_home(user)
+    uv = shutil.which("uv", path=f"{home}/.local/bin:{os.environ.get('PATH', os.defpath)}")
+    if uv is None:
+        log("uv not found, skipping uv-tools-restore.sh.")
+        return
+    cmd = ["runuser", "-u", user, "--", "env", f"HOME={home}", uv, "tool", "list", "--show-with"]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        log(f"Warning: '{' '.join(cmd)}' failed: {result.stderr.strip()}")
+        return
+    commands = uv_tool_install_lines(result.stdout)
+    if not commands:
+        log("No uv tools found, skipping uv-tools-restore.sh.")
+        return
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    write_restore_script(
+        LISTS_DIR / "uv-tools-restore.sh",
+        f"Generated by btrfs_backup.py on {stamp}: reinstall uv tools. Run as {user}.",
+        commands,
+        log,
+    )
+
+
 def build_rsync_command(
     source: Path,
     target: Path,
@@ -492,9 +567,10 @@ def local_root_option(f: Callable[..., Any]) -> Callable[..., Any]:
     """Add the required ``--local-root`` option to a click command."""
     return click.option(
         "--local-root",
-        required=True,
+        default=default_local_root,
+        show_default=f"{MEDIA_DIR}/<USER>/{LOCAL_ROOT_SUBPATH}",
         type=click.Path(path_type=Path),
-        help="Mountpoint of the local btrfs backup disk (e.g. /media/kound/ssd-backup).",
+        help="Mountpoint of the local btrfs backup disk. <USER> is the user with UID 1000.",
     )(f)
 
 
@@ -502,9 +578,11 @@ def remote_root_option(f: Callable[..., Any]) -> Callable[..., Any]:
     """Add the required ``--remote-root`` option to a click command."""
     return click.option(
         "--remote-root",
-        required=True,
+        default=default_remote_root,
+        show_default=f"{MEDIA_DIR}/<USER>/{REMOTE_ROOT_SUBPATH}",
         type=click.Path(path_type=Path),
-        help="Mountpoint of the remote btrfs backup disk (e.g. /media/kound/hdd-backup).",
+        help="Directory on the remote btrfs disk that receives the snapshots. "
+        "<USER> is the user with UID 1000.",
     )(f)
 
 
@@ -718,10 +796,13 @@ def create_in_progress_subvolume(snapshots: list[Path], tmp: Path) -> str:
     help="rsync filter rules (includes/excludes). Must exist.",
 )
 @click.option(
-    "--flatpak-user",
-    default="kound",
-    show_default=True,
-    help="User whose per-user flatpak list is saved (empty string to skip).",
+    "--primary-user",
+    "primary_user_name",
+    default=primary_user,
+    show_default="the user with UID 1000",
+    help="The main user of this computer. The per-user exports are done for this user only: "
+    "its flatpak list and remotes (flatpak-user.txt, flatpak-remotes-user.txt) and its "
+    "uv tools (uv-tools-restore.sh). System-wide lists are always saved.",
 )
 @click.option(
     "--ollama-dir",
@@ -748,7 +829,7 @@ def local_backup(
     local_root: Path,
     source: Path,
     filter_file: Path,
-    flatpak_user: str,
+    primary_user_name: str,
     ollama_dir: tuple[Path, ...],
     one_file_system: bool,
     inplace: bool,
@@ -797,8 +878,9 @@ def local_backup(
     detail = "aborted by an error or an interrupt"
     try:
         # Lists are written before the copy so they end up inside this snapshot.
-        save_package_lists(flatpak_user, log)
+        save_package_lists(primary_user_name, log)
         save_model_restore_scripts(ollama_dir, log)
+        save_uv_tools_script(primary_user_name, log)
 
         rsync_cmd = build_rsync_command(
             source,
