@@ -14,7 +14,7 @@ Subcommands:
     init-remote    Check that the remote backup disk is a mounted btrfs filesystem.
     local          Back up SOURCE into a new read-only snapshot on the local disk
                    (and point <local-root>/current at it).
-    remote         Send the newest local snapshot to the remote disk (incremental if possible).
+    remote         Send all local snapshots missing on the remote disk, oldest first (incremental).
     delete-local   Safely delete a local snapshot (refuses if not yet sent to the remote).
     install        Install this script system-wide with 'sudo install' (run as a normal user).
 
@@ -219,8 +219,20 @@ def update_current_link(local_root: Path) -> None:
     click.echo(f"{link} -> {SNAP_DIR_NAME}/{newest.name}")
 
 
-def is_received_complete(subvol: Path) -> bool:
-    """True if `subvol` on the remote finished `btrfs receive` (has a Received UUID)."""
+def is_complete_subvolume(subvol: Path) -> bool:
+    """Tell whether ``subvol`` is a finished, read-only subvolume.
+
+    ``btrfs receive`` creates the subvolume writable and only marks it read-only once the
+    whole stream has arrived, so a read-only subvolume is a complete one. This also holds
+    for snapshots that were created directly on that disk, for example by replaying old
+    backups, which have no "Received UUID".
+
+    Args:
+        subvol: Path of the subvolume to check; it does not need to exist.
+
+    Returns:
+        True if ``btrfs subvolume show`` reports the ``readonly`` flag.
+    """
     result = subprocess.run(
         ["btrfs", "subvolume", "show", str(subvol)], capture_output=True, text=True, check=False
     )
@@ -228,9 +240,8 @@ def is_received_complete(subvol: Path) -> bool:
         return False
     for line in result.stdout.splitlines():
         stripped = line.strip()
-        if stripped.startswith("Received UUID:"):
-            value = stripped.split(":", 1)[1].strip()
-            return value not in ("", "-")
+        if stripped.startswith("Flags:"):
+            return "readonly" in stripped.split(":", 1)[1]
     return False
 
 
@@ -832,55 +843,48 @@ def local_backup(
 # ---- remote -------------------------------------------------------------------
 
 
-@cli.command("remote")
-@local_root_option
-@remote_root_option
-def remote_backup(local_root: Path, remote_root: Path) -> None:
-    """Send the newest local snapshot to the remote disk (incremental when possible)."""
-    require_root()
-    ensure_mounted_btrfs(local_root)
-    ensure_mounted_btrfs(remote_root)
+def find_remote_parent(snapshots: list[Path], snapshot: Path, remote_root: Path) -> Path | None:
+    """Find the parent for an incremental send of ``snapshot``.
 
-    snap_dir = local_root / SNAP_DIR_NAME
-    snapshots = list_snapshots(snap_dir)
-    if not snapshots:
-        raise click.ClickException("No local snapshots found. Run 'local' first.")
+    Args:
+        snapshots: All local snapshots, oldest first.
+        snapshot: The snapshot that is about to be sent.
+        remote_root: Directory on the remote disk that receives the snapshots.
 
-    newest = snapshots[-1]
-    last_sent = read_marker(local_root)
+    Returns:
+        The newest local snapshot older than ``snapshot`` that also exists, complete, on the
+        remote disk, or None if there is none (the send then has to be a full one).
+    """
+    older = [s for s in snapshots if s.name < snapshot.name]
+    for candidate in reversed(older):
+        if is_complete_subvolume(remote_root / candidate.name):
+            return candidate
+    return None
 
-    if last_sent == newest.name:
-        click.echo(f"Newest snapshot {newest.name} was already sent, nothing to do.")
-        return
 
-    target = remote_root / newest.name
-    if target.exists():
-        if is_received_complete(target):
-            click.echo(f"{newest.name} is already complete on the remote, updating marker.")
-            write_marker(local_root, newest.name)
-            return
-        raise click.ClickException(
-            f"{target} exists on the remote but looks incomplete. "
-            f"Check it, then remove it with 'btrfs subvolume delete {target}' and retry."
-        )
+def send_snapshot(snapshot: Path, parent: Path | None, remote_root: Path) -> None:
+    """Send one snapshot with ``btrfs send | btrfs receive`` and verify the result.
 
-    send_cmd = ["btrfs", "send", str(newest)]
-    if last_sent is None:
-        click.echo("No previous send recorded, performing full send.")
+    A partially received subvolume is removed again if anything fails.
+
+    Args:
+        snapshot: The local read-only snapshot to send.
+        parent: Snapshot that exists on both disks, for an incremental send; None for a full one.
+        remote_root: Directory on the remote disk that receives the snapshot.
+
+    Raises:
+        click.ClickException: If sending, receiving or the final check fails.
+    """
+    target = remote_root / snapshot.name
+    if parent is None:
+        send_cmd = ["btrfs", "send", str(snapshot)]
     else:
-        parent = snap_dir / last_sent
-        if parent.exists() and (remote_root / last_sent).exists():
-            send_cmd = ["btrfs", "send", "-p", str(parent), str(newest)]
-        else:
-            click.echo(
-                f"Parent {last_sent} is missing locally or on the remote, "
-                "falling back to a full send."
-            )
+        send_cmd = ["btrfs", "send", "-p", str(parent), str(snapshot)]
 
     success = False
     try:
         run_pipe(send_cmd, ["btrfs", "receive", str(remote_root)])
-        if not is_received_complete(target):
+        if not is_complete_subvolume(target):
             raise click.ClickException(f"{target} is not complete after receive.")
         success = True
     finally:
@@ -888,8 +892,52 @@ def remote_backup(local_root: Path, remote_root: Path) -> None:
             click.echo("Removing the partially received subvolume on the remote.", err=True)
             subprocess.run(["btrfs", "subvolume", "delete", str(target)], check=False)
 
-    write_marker(local_root, newest.name)
-    click.echo(f"Sent {newest.name} to {remote_root}")
+
+@cli.command("remote")
+@local_root_option
+@remote_root_option
+def remote_backup(local_root: Path, remote_root: Path) -> None:
+    """Send all local snapshots that are missing on the remote disk.
+
+    Snapshots newer than the last confirmed one are sent oldest first, each incrementally
+    against the newest older snapshot that exists on both disks (a full send if there is
+    none). The progress is recorded after every snapshot, so an interrupted run continues
+    where it stopped. Delete .last_sent_snapshot to check all snapshots again; those that
+    are already on the remote are skipped.
+    """
+    require_root()
+    ensure_mounted_btrfs(local_root)
+    ensure_mounted_btrfs(remote_root)
+
+    snapshots = list_snapshots(local_root / SNAP_DIR_NAME)
+    if not snapshots:
+        raise click.ClickException("No local snapshots found. Run 'local' first.")
+
+    last_sent = read_marker(local_root)
+    pending = snapshots
+    if last_sent is not None:
+        pending = [s for s in snapshots if s.name > last_sent]
+    if not pending:
+        click.echo(f"Nothing to send, {snapshots[-1].name} is already on the remote.")
+        return
+
+    click.echo(f"Sending {len(pending)} snapshot(s): " + ", ".join(s.name for s in pending))
+    for snapshot in pending:
+        target = remote_root / snapshot.name
+        if target.exists():
+            if not is_complete_subvolume(target):
+                raise click.ClickException(
+                    f"{target} exists on the remote but looks incomplete. "
+                    f"Check it, then remove it with 'btrfs subvolume delete {target}' and retry."
+                )
+            click.echo(f"{snapshot.name} is already complete on the remote, skipping.")
+        else:
+            parent = find_remote_parent(snapshots, snapshot, remote_root)
+            if parent is None:
+                click.echo(f"No common parent for {snapshot.name}, performing a full send.")
+            send_snapshot(snapshot, parent, remote_root)
+            click.echo(f"Sent {snapshot.name} to {remote_root}")
+        write_marker(local_root, snapshot.name)
 
 
 # ---- delete-local -------------------------------------------------------------
