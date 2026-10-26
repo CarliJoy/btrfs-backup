@@ -1,0 +1,35 @@
+[project]
+name = "btrfs-backup"
+dynamic = ["version"]
+description = "Backup chain: ext4 source -> local btrfs (rsync + snapshots) -> remote btrfs (send/receive)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["click>=8.0"]
+
+[project.scripts]
+btrfs-backup = "btrfs_backup.cli:cli"
+
+[dependency-groups]
+dev = ["mypy>=1.10", "ruff>=0.5"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Single source of truth for the version: __version__ in cli.py
+[tool.hatch.version]
+path = "src/btrfs_backup/cli.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/btrfs_backup"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
