@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-btrfs-backup (run as root, except for `install`)
+"""btrfs-backup: rsync and btrfs snapshots, run as root (except for ``install``).
 
 This file is intentionally self-contained (standard library + click only): the
 `install` subcommand copies exactly this file to /usr/local/sbin, where it runs
@@ -46,6 +45,7 @@ from typing import Any
 
 import click
 
+
 __version__ = "0.1.0"
 
 INSTALL_DEST = Path("/usr/local/sbin/btrfs-backup")
@@ -59,7 +59,7 @@ INPROGRESS_PREFIX = ".backup_inprogress_"
 CURRENT_LINK_NAME = "current"
 LOG_FILE_NAME = "backup.log"  # lives in the root of every backup (and snapshot)
 LOG_TIME_FMT = "%Y-%m-%d %H:%M:%S"
-# rsync always starts its own log lines with "YYYY/MM/DD HH:MM:SSq [pid] " (not configurable,
+# rsync always starts its own log lines with "YYYY/MM/DD HH:MM:SS [pid] " (not configurable,
 # --log-file-format only changes what follows), so those dates are rewritten after the run.
 RSYNC_LOG_DATE = re.compile(rb"^(\d{4})/(\d{2})/(\d{2}) ")
 
@@ -70,12 +70,23 @@ LISTS_DIR = Path("/root/backup-lists")
 
 # rsync exit codes that still count as a successful backup:
 # 0 = ok, 24 = "some source files vanished" (normal when copying a live system)
-RSYNC_OK_CODES = (0, 24)
+RSYNC_VANISHED_CODE = 24
+RSYNC_OK_CODES = (0, RSYNC_VANISHED_CODE)
+
+# Ollama manifests live in manifests/<registry>/<namespace>/<model>/<tag>.
+MIN_MANIFEST_PARTS = 3  # registry, model, tag (the namespace can be missing)
+LIBRARY_MODEL_PARTS = 2  # "library" and the model name
 
 
 # ---- helpers ----------------------------------------------------------------
 
+
 def require_root() -> None:
+    """Abort with an error message unless the script runs as root.
+
+    Raises:
+        click.ClickException: If the effective user id is not 0.
+    """
     if os.geteuid() != 0:
         raise click.ClickException("This command must be run as root (use sudo).")
 
@@ -84,6 +95,7 @@ def start_log(log_path: Path, first_message: str) -> LogFn:
     """Overwrite the log with a first line and return a function that logs to file and terminal."""
 
     def log(message: str) -> None:
+        """Print a timestamped line and append it to the log file."""
         line = datetime.now().strftime(LOG_TIME_FMT) + " " + message
         click.echo(line)
         with log_path.open("a") as handle:
@@ -94,14 +106,37 @@ def start_log(log_path: Path, first_message: str) -> LogFn:
     return log
 
 
-def run(cmd: Sequence[str | Path], check: bool = True,
-        **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+def run(
+    cmd: Sequence[str | Path], check: bool = True, **kwargs: Any
+) -> subprocess.CompletedProcess[Any]:
+    """Print a command and run it.
+
+    Args:
+        cmd: Program and arguments; paths are converted to strings.
+        check: Raise ``CalledProcessError`` on a non-zero exit code.
+        **kwargs: Passed through to ``subprocess.run``.
+
+    Returns:
+        The completed process.
+    """
     args = [str(c) for c in cmd]
     click.echo("$ " + " ".join(args))
     return subprocess.run(args, check=check, **kwargs)
 
 
 def run_pipe(send_cmd: Sequence[str], receive_cmd: Sequence[str]) -> None:
+    """Run ``send_cmd | receive_cmd`` and fail if either side fails.
+
+    Used for ``btrfs send | btrfs receive``. Both exit codes are checked, whereas a plain
+    shell pipe only reports the last one.
+
+    Args:
+        send_cmd: Command whose stdout is piped into the receiver.
+        receive_cmd: Command reading the stream from its stdin.
+
+    Raises:
+        click.ClickException: If the send or the receive process exits non-zero.
+    """
     click.echo("$ " + " ".join(send_cmd) + " | " + " ".join(receive_cmd))
     send = subprocess.Popen(send_cmd, stdout=subprocess.PIPE)
     receive = subprocess.Popen(receive_cmd, stdin=send.stdout)
@@ -127,7 +162,9 @@ def ensure_mounted_btrfs(path: Path) -> None:
         raise click.ClickException(f"{path} is not a mountpoint. Mount the disk first.")
     result = subprocess.run(
         ["findmnt", "-n", "-o", "FSTYPE", "--target", str(path)],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     fstype = result.stdout.strip()
     if fstype != "btrfs":
@@ -135,12 +172,17 @@ def ensure_mounted_btrfs(path: Path) -> None:
 
 
 def list_snapshots(snap_dir: Path) -> list[Path]:
+    """Return the ``backup_*`` snapshot directories in ``snap_dir``, oldest first.
+
+    The names contain a sortable timestamp. Returns an empty list if the directory is missing.
+    """
     if not snap_dir.exists():
         return []
     return sorted(p for p in snap_dir.iterdir() if p.is_dir() and p.name.startswith(SNAP_PREFIX))
 
 
 def read_marker(local_root: Path) -> str | None:
+    """Return the name of the last snapshot confirmed sent to the remote, or None if unknown."""
     marker = local_root / MARKER_FILE
     if marker.exists():
         return marker.read_text().strip()
@@ -148,6 +190,7 @@ def read_marker(local_root: Path) -> str | None:
 
 
 def write_marker(local_root: Path, snapshot_name: str) -> None:
+    """Record ``snapshot_name`` as the last snapshot successfully sent to the remote."""
     (local_root / MARKER_FILE).write_text(snapshot_name + "\n")
 
 
@@ -172,14 +215,14 @@ def update_current_link(local_root: Path) -> None:
     if os.path.lexists(tmp_link):
         tmp_link.unlink()
     tmp_link.symlink_to(Path(SNAP_DIR_NAME) / newest.name)
-    os.replace(tmp_link, link)
+    tmp_link.replace(link)
     click.echo(f"{link} -> {SNAP_DIR_NAME}/{newest.name}")
 
 
 def is_received_complete(subvol: Path) -> bool:
     """True if `subvol` on the remote finished `btrfs receive` (has a Received UUID)."""
     result = subprocess.run(
-        ["btrfs", "subvolume", "show", str(subvol)], capture_output=True, text=True
+        ["btrfs", "subvolume", "show", str(subvol)], capture_output=True, text=True, check=False
     )
     if result.returncode != 0:
         return False
@@ -202,33 +245,48 @@ def save_package_lists(flatpak_user: str, log: LogFn) -> None:
         jobs.append(("snaps.txt", ["snap", "list"]))
 
     if shutil.which("flatpak"):
-        jobs.append((
-            "flatpak-system.txt",
-            ["flatpak", "list", "--system", "--app", "--columns=origin,application"],
-        ))
-        jobs.append((
-            "flatpak-remotes-system.txt",
-            ["flatpak", "remotes", "--system", "--columns=name,url"],
-        ))
+        jobs.append(
+            (
+                "flatpak-system.txt",
+                ["flatpak", "list", "--system", "--app", "--columns=origin,application"],
+            )
+        )
+        jobs.append(
+            (
+                "flatpak-remotes-system.txt",
+                ["flatpak", "remotes", "--system", "--columns=name,url"],
+            )
+        )
         if flatpak_user:
             try:
                 home = pwd.getpwnam(flatpak_user).pw_dir
             except KeyError:
                 raise click.ClickException(f"Unknown user for flatpaks: {flatpak_user!r}") from None
             as_user = ["runuser", "-u", flatpak_user, "--", "env", f"HOME={home}"]
-            jobs.append((
-                "flatpak-user.txt",
-                as_user + ["flatpak", "list", "--user", "--app", "--columns=origin,application"],
-            ))
-            jobs.append((
-                "flatpak-remotes-user.txt",
-                as_user + ["flatpak", "remotes", "--user", "--columns=name,url"],
-            ))
+            jobs.append(
+                (
+                    "flatpak-user.txt",
+                    [
+                        *as_user,
+                        "flatpak",
+                        "list",
+                        "--user",
+                        "--app",
+                        "--columns=origin,application",
+                    ],
+                )
+            )
+            jobs.append(
+                (
+                    "flatpak-remotes-user.txt",
+                    [*as_user, "flatpak", "remotes", "--user", "--columns=name,url"],
+                )
+            )
     else:
         log("flatpak not installed, skipping flatpak lists.")
 
     for filename, cmd in jobs:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             log(f"Warning: '{' '.join(cmd)}' failed: {result.stderr.strip()}")
         else:
@@ -267,13 +325,13 @@ def ollama_refs(manifest_dirs: Iterable[Path]) -> list[str]:
             if not path.is_file():
                 continue
             parts = path.relative_to(manifests).parts
-            if len(parts) < 3:
+            if len(parts) < MIN_MANIFEST_PARTS:
                 continue
             registry = parts[0]
             tag = parts[-1]
             middle = parts[1:-1]
             if registry == "registry.ollama.ai":
-                if len(middle) == 2 and middle[0] == "library":
+                if len(middle) == LIBRARY_MODEL_PARTS and middle[0] == "library":
                     name = middle[1]
                 else:
                     name = "/".join(middle)
@@ -294,7 +352,7 @@ def huggingface_repos() -> list[str]:
             continue
         for entry in hub.glob("models--*"):
             if entry.is_dir():
-                repos.add(entry.name[len("models--"):].replace("--", "/"))
+                repos.add(entry.name[len("models--") :].replace("--", "/"))
     return sorted(repos)
 
 
@@ -304,10 +362,18 @@ def normalize_rsync_log_dates(log_path: Path) -> None:
     with log_path.open("rb") as source, staged.open("wb") as target:
         for line in source:
             target.write(RSYNC_LOG_DATE.sub(rb"\1-\2-\3 ", line, count=1))
-    os.replace(staged, log_path)
+    staged.replace(log_path)
 
 
 def write_restore_script(path: Path, comment: str, body_lines: Iterable[str], log: LogFn) -> None:
+    """Write an executable ``/bin/sh`` script and log its path.
+
+    Args:
+        path: Where to write the script.
+        comment: Text of the comment line below the shebang.
+        body_lines: The commands, one per line.
+        log: Logging function from ``start_log``.
+    """
     content = "#!/bin/sh\n# " + comment + "\n" + "\n".join(body_lines) + "\n"
     path.write_text(content)
     path.chmod(0o755)
@@ -322,8 +388,7 @@ def save_model_restore_scripts(extra_ollama_dirs: Iterable[Path], log: LogFn) ->
     refs = ollama_refs(find_ollama_manifest_dirs(extra_ollama_dirs))
     if refs:
         lines = ["set -u"]
-        for ref in refs:
-            lines.append("ollama pull " + shlex.quote(ref))
+        lines.extend("ollama pull " + shlex.quote(ref) for ref in refs)
         write_restore_script(
             LISTS_DIR / "ollama-restore.sh",
             f"Generated by btrfs_backup.py on {stamp}: re-download Ollama models.",
@@ -336,11 +401,10 @@ def save_model_restore_scripts(extra_ollama_dirs: Iterable[Path], log: LogFn) ->
     repos = huggingface_repos()
     if repos:
         lines = [
-            'HF=$(command -v hf || command -v huggingface-cli) || '
+            "HF=$(command -v hf || command -v huggingface-cli) || "
             '{ echo "hf / huggingface-cli not found" >&2; exit 1; }'
         ]
-        for repo in repos:
-            lines.append('"$HF" download ' + shlex.quote(repo))
+        lines.extend('"$HF" download ' + shlex.quote(repo) for repo in repos)
         write_restore_script(
             LISTS_DIR / "huggingface-restore.sh",
             f"Generated by btrfs_backup.py on {stamp}: re-download Hugging Face models.",
@@ -351,14 +415,41 @@ def save_model_restore_scripts(extra_ollama_dirs: Iterable[Path], log: LogFn) ->
         log("No Hugging Face models found, skipping huggingface-restore.sh.")
 
 
-def build_rsync_command(source: Path, target: Path, filter_file: Path,
-                        one_file_system: bool, dry_run: bool, inplace: bool,
-                        log_file: Path | None) -> list[str]:
+def build_rsync_command(
+    source: Path,
+    target: Path,
+    filter_file: Path,
+    *,
+    one_file_system: bool,
+    dry_run: bool,
+    inplace: bool,
+    log_file: Path | None,
+) -> list[str]:
+    """Build the rsync command line for one backup run.
+
+    The destination's ``backup.log`` is protected from ``--delete-excluded`` by two filter
+    rules that come before the user's filter file (rsync uses the first matching rule).
+
+    Args:
+        source: Directory to back up.
+        target: Destination directory (the in-progress subvolume).
+        filter_file: rsync filter rules file, merged after the log protection rules.
+        one_file_system: Do not cross filesystem boundaries (``-x``).
+        dry_run: Only show what would change, together with statistics.
+        inplace: Update changed files block by block so btrfs keeps sharing unchanged blocks.
+        log_file: Let rsync log every changed item and the statistics to this file.
+
+    Returns:
+        The command as an argument list.
+    """
     source_arg = str(source).rstrip("/") + "/"
     target_arg = str(target).rstrip("/") + "/"
     cmd = [
-        "rsync", "-aAXH", "--numeric-ids",
-        "--delete", "--delete-excluded",
+        "rsync",
+        "-aAXH",
+        "--numeric-ids",
+        "--delete",
+        "--delete-excluded",
         # The log lives in the destination root: protect it from --delete(-excluded).
         # These two rules must come before the user's filter file (first match wins).
         f"--filter=P /{LOG_FILE_NAME}",
@@ -378,23 +469,30 @@ def build_rsync_command(source: Path, target: Path, filter_file: Path,
     if log_file is not None:
         # One timestamped line per created/changed/deleted item, plus the statistics.
         # The timestamp prefix itself is fixed by rsync (see normalize_rsync_log_dates).
-        cmd +=[f"--log-file={log_file}", "--log-file-format=%i %n%L", "--stats"]
+        cmd += [f"--log-file={log_file}", "--log-file-format=%i %n%L", "--stats"]
     cmd += [source_arg, target_arg]
     return cmd
 
 
 # ---- shared options -----------------------------------------------------------
 
+
 def local_root_option(f: Callable[..., Any]) -> Callable[..., Any]:
+    """Add the required ``--local-root`` option to a click command."""
     return click.option(
-        "--local-root", required=True, type=click.Path(path_type=Path),
+        "--local-root",
+        required=True,
+        type=click.Path(path_type=Path),
         help="Mountpoint of the local btrfs backup disk (e.g. /media/kound/ssd-backup).",
     )(f)
 
 
 def remote_root_option(f: Callable[..., Any]) -> Callable[..., Any]:
+    """Add the required ``--remote-root`` option to a click command."""
     return click.option(
-        "--remote-root", required=True, type=click.Path(path_type=Path),
+        "--remote-root",
+        required=True,
+        type=click.Path(path_type=Path),
         help="Mountpoint of the remote btrfs backup disk (e.g. /media/kound/hdd-backup).",
     )(f)
 
@@ -402,17 +500,27 @@ def remote_root_option(f: Callable[..., Any]) -> Callable[..., Any]:
 @click.group()
 @click.version_option(__version__, prog_name="btrfs-backup")
 def cli() -> None:
-    """btrfs backup helper: SOURCE -> local (btrfs) -> remote (btrfs). Run as root."""
+    """Snapshot backups: SOURCE -> local (btrfs) -> remote (btrfs). Run as root."""
 
 
 # ---- install ------------------------------------------------------------------
 
+
 @cli.command("install")
-@click.option("--dest", default=INSTALL_DEST, show_default=True,
-              type=click.Path(path_type=Path, dir_okay=False),
-              help="Where to install the script.")
-@click.option("--python", "python_path", default=SYSTEM_PYTHON, show_default=True,
-              help="Interpreter written into the shebang line (must be able to import click).")
+@click.option(
+    "--dest",
+    default=INSTALL_DEST,
+    show_default=True,
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Where to install the script.",
+)
+@click.option(
+    "--python",
+    "python_path",
+    default=SYSTEM_PYTHON,
+    show_default=True,
+    help="Interpreter written into the shebang line (must be able to import click).",
+)
 def install_command(dest: Path, python_path: str) -> None:
     """Install this script system-wide with 'sudo install'. Run as a normal user."""
     source = Path(__file__).resolve()
@@ -422,7 +530,9 @@ def install_command(dest: Path, python_path: str) -> None:
             "'uv run btrfs-backup install' from the project checkout."
         )
 
-    check = subprocess.run([python_path, "-I", "-c", "import click"], capture_output=True)
+    check = subprocess.run(
+        [python_path, "-I", "-c", "import click"], capture_output=True, check=False
+    )
     if check.returncode != 0:
         click.echo(
             f"Warning: {python_path} cannot import click. "
@@ -446,12 +556,26 @@ def install_command(dest: Path, python_path: str) -> None:
     with tempfile.TemporaryDirectory() as staging_dir:
         staged = Path(staging_dir) / dest.name
         staged.write_text("".join(lines))
-        run([*privilege_prefix, "install", "-D", "-m", "755", "-o", "root", "-g", "root",
-             staged, dest])
+        run(
+            [
+                *privilege_prefix,
+                "install",
+                "-D",
+                "-m",
+                "755",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                staged,
+                dest,
+            ]
+        )
     click.echo(f"Installed {dest}")
 
 
 # ---- init-local ---------------------------------------------------------------
+
 
 @cli.command("init-local")
 @local_root_option
@@ -470,6 +594,7 @@ def init_local(local_root: Path) -> None:
 
 # ---- init-remote --------------------------------------------------------------
 
+
 @cli.command("init-remote")
 @remote_root_option
 def init_remote(remote_root: Path) -> None:
@@ -479,35 +604,152 @@ def init_remote(remote_root: Path) -> None:
     click.echo(f"Remote target {remote_root} is ready to receive snapshots.")
 
 
+def warn_about_leftovers(local_root: Path) -> None:
+    """Warn about incomplete ``.backup_inprogress_*`` subvolumes left by earlier runs."""
+    for leftover in sorted(local_root.glob(INPROGRESS_PREFIX + "*")):
+        click.echo(
+            f"Warning: incomplete backup from an earlier run: {leftover} "
+            f"(delete with 'btrfs subvolume delete {leftover}')",
+            err=True,
+        )
+
+
+def dry_run_backup(
+    source: Path,
+    snapshots: list[Path],
+    filter_file: Path,
+    *,
+    one_file_system: bool,
+    inplace: bool,
+) -> None:
+    """Show what rsync would change compared to the newest snapshot; create nothing.
+
+    Args:
+        source: Directory to back up.
+        snapshots: Existing snapshots, oldest first. Without any, everything counts as new.
+        filter_file: rsync filter rules file.
+        one_file_system: Do not cross filesystem boundaries.
+        inplace: Mirror the real run's in-place update mode.
+
+    Raises:
+        click.ClickException: If rsync fails.
+    """
+    with tempfile.TemporaryDirectory() as empty_dir:
+        compare_to = Path(empty_dir)
+        if snapshots:
+            compare_to = snapshots[-1]
+        command = build_rsync_command(
+            source,
+            compare_to,
+            filter_file,
+            one_file_system=one_file_system,
+            dry_run=True,
+            inplace=inplace,
+            log_file=None,
+        )
+        result = run(command, check=False)
+    if result.returncode not in RSYNC_OK_CODES:
+        raise click.ClickException(f"rsync dry run failed with exit code {result.returncode}")
+    click.echo("Dry run only, nothing was changed.")
+
+
+def commit_snapshot(tmp: Path, snap_path: Path, local_root: Path) -> None:
+    """Freeze a finished working subvolume as a read-only snapshot and point ``current`` at it.
+
+    Args:
+        tmp: The working subvolume that rsync completed successfully.
+        snap_path: Destination of the read-only snapshot.
+        local_root: The local backup root, where the ``current`` link lives.
+    """
+    run(["btrfs", "subvolume", "snapshot", "-r", tmp, snap_path])
+    run(["btrfs", "subvolume", "delete", tmp])
+    click.echo(f"Created snapshot: {snap_path}")
+    update_current_link(local_root)
+
+
+def create_in_progress_subvolume(snapshots: list[Path], tmp: Path) -> str:
+    """Create the writable working subvolume for a new backup.
+
+    It starts as a clone of the newest snapshot, so unchanged data stays shared via
+    copy-on-write, or as an empty subvolume on the very first run.
+
+    Args:
+        snapshots: Existing snapshots, oldest first.
+        tmp: Path of the working subvolume to create.
+
+    Returns:
+        Text for the first log line, saying what the backup started from.
+    """
+    if snapshots:
+        run(["btrfs", "subvolume", "snapshot", snapshots[-1], tmp])
+        return f"started from old {snapshots[-1].name}"
+    run(["btrfs", "subvolume", "create", tmp])
+    return "started from scratch (no previous snapshot)"
+
+
 # ---- local --------------------------------------------------------------------
+
 
 @cli.command("local")
 @local_root_option
-@click.option("--source", default="/", show_default=True,
-              type=click.Path(path_type=Path, exists=True),
-              help="Directory to back up.")
-@click.option("--filter-file", default=DEFAULT_FILTER_FILE, show_default=True,
-              type=click.Path(path_type=Path, exists=True, dir_okay=False),
-              help="rsync filter rules (includes/excludes). Must exist.")
-@click.option("--flatpak-user", default="kound", show_default=True,
-              help="User whose per-user flatpak list is saved (empty string to skip).")
-@click.option("--ollama-dir", multiple=True, type=click.Path(path_type=Path),
-              help="Extra Ollama models directory (the one containing 'manifests'). "
-                   "Default locations, $OLLAMA_MODELS and ~/.ollama are found automatically.")
-@click.option("--one-file-system/--cross-filesystems", default=True, show_default=True,
-              help="Do not descend into other filesystems (rsync -x).")
-@click.option("--inplace/--no-inplace", default=True, show_default=True,
-              help="Update changed files in place, block by block (saves space on btrfs).")
+@click.option(
+    "--source",
+    default="/",
+    show_default=True,
+    type=click.Path(path_type=Path, exists=True),
+    help="Directory to back up.",
+)
+@click.option(
+    "--filter-file",
+    default=DEFAULT_FILTER_FILE,
+    show_default=True,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    help="rsync filter rules (includes/excludes). Must exist.",
+)
+@click.option(
+    "--flatpak-user",
+    default="kound",
+    show_default=True,
+    help="User whose per-user flatpak list is saved (empty string to skip).",
+)
+@click.option(
+    "--ollama-dir",
+    multiple=True,
+    type=click.Path(path_type=Path),
+    help="Extra Ollama models directory (the one containing 'manifests'). "
+    "Default locations, $OLLAMA_MODELS and ~/.ollama are found automatically.",
+)
+@click.option(
+    "--one-file-system/--cross-filesystems",
+    default=True,
+    show_default=True,
+    help="Do not descend into other filesystems (rsync -x).",
+)
+@click.option(
+    "--inplace/--no-inplace",
+    default=True,
+    show_default=True,
+    help="Update changed files in place, block by block (saves space on btrfs).",
+)
 @click.option("--dry-run", is_flag=True, help="Show what rsync would change, create nothing.")
-def local_backup(local_root: Path, source: Path, filter_file: Path, flatpak_user: str,
-                 ollama_dir: tuple[Path, ...], one_file_system: bool, inplace: bool,
-                 dry_run: bool) -> None:
-    """
-    rsync SOURCE into a disposable clone of the last good snapshot and only
-    commit a new read-only snapshot if rsync succeeds. A failed or killed run never
-    leaves a partial snapshot behind: its timestamped .backup_inprogress_<time>
-    subvolume is kept for inspection (with backup.log) and never blocks later
-    runs. Delete it manually with 'btrfs subvolume delete'.
+def local_backup(
+    *,
+    local_root: Path,
+    source: Path,
+    filter_file: Path,
+    flatpak_user: str,
+    ollama_dir: tuple[Path, ...],
+    one_file_system: bool,
+    inplace: bool,
+    dry_run: bool,
+) -> None:
+    """Back up SOURCE into a new read-only snapshot on the local disk.
+
+    rsync copies into a disposable clone of the last good snapshot, and a read-only
+    snapshot is only committed if rsync succeeds. A failed or killed run never leaves a
+    partial snapshot behind: its timestamped .backup_inprogress_<time> subvolume is kept
+    for inspection (with backup.log) and never blocks later runs. Delete it manually
+    with 'btrfs subvolume delete'.
     """
     require_root()
     ensure_mounted_btrfs(local_root)
@@ -524,38 +766,16 @@ def local_backup(local_root: Path, source: Path, filter_file: Path, flatpak_user
             f"{tmp.name} or {snap_path.name} already exists, retry in a second."
         )
 
-    for leftover in sorted(local_root.glob(INPROGRESS_PREFIX + "*")):
-        click.echo(
-            f"Warning: incomplete backup from an earlier run: {leftover} "
-            f"(delete with 'btrfs subvolume delete {leftover}')",
-            err=True,
-        )
-
+    warn_about_leftovers(local_root)
     snapshots = list_snapshots(snap_dir)
 
     if dry_run:
-        if snapshots:
-            result = run(build_rsync_command(source, snapshots[-1], filter_file,
-                                             one_file_system, True, inplace, None),
-                         check=False)
-        else:
-            with tempfile.TemporaryDirectory() as empty_dir:
-                result = run(build_rsync_command(source, Path(empty_dir), filter_file,
-                                                 one_file_system, True, inplace, None),
-                             check=False)
-        if result.returncode not in RSYNC_OK_CODES:
-            raise click.ClickException(f"rsync dry run failed with exit code {result.returncode}")
-        click.echo("Dry run only, nothing was changed.")
+        dry_run_backup(
+            source, snapshots, filter_file, one_file_system=one_file_system, inplace=inplace
+        )
         return
 
-    # Start from a writable clone of the last good snapshot (empty on the very
-    # first run): unchanged data stays shared via copy-on-write.
-    if snapshots:
-        run(["btrfs", "subvolume", "snapshot", snapshots[-1], tmp])
-        origin = f"started from old {snapshots[-1].name}"
-    else:
-        run(["btrfs", "subvolume", "create", tmp])
-        origin = "started from scratch (no previous snapshot)"
+    origin = create_in_progress_subvolume(snapshots, tmp)
 
     # First thing in the new backup: replace the log inherited from the old snapshot.
     log_path = tmp / LOG_FILE_NAME
@@ -569,14 +789,21 @@ def local_backup(local_root: Path, source: Path, filter_file: Path, flatpak_user
         save_package_lists(flatpak_user, log)
         save_model_restore_scripts(ollama_dir, log)
 
-        rsync_cmd = build_rsync_command(source, tmp, filter_file, one_file_system, False,
-                                        inplace, log_path)
+        rsync_cmd = build_rsync_command(
+            source,
+            tmp,
+            filter_file,
+            one_file_system=one_file_system,
+            dry_run=False,
+            inplace=inplace,
+            log_file=log_path,
+        )
         log("$ " + " ".join(rsync_cmd))
-        rsync_code = subprocess.run(rsync_cmd).returncode
+        rsync_code = subprocess.run(rsync_cmd, check=False).returncode
         if rsync_code in RSYNC_OK_CODES:
             success = True
             detail = f"rsync exit code {rsync_code}"
-            if rsync_code == 24:
+            if rsync_code == RSYNC_VANISHED_CODE:
                 log("Note: some files vanished during the copy (normal on a live system).")
         else:
             detail = f"rsync failed with exit code {rsync_code}"
@@ -599,13 +826,11 @@ def local_backup(local_root: Path, source: Path, filter_file: Path, flatpak_user
             "'btrfs subvolume delete' when you no longer need it."
         )
 
-    run(["btrfs", "subvolume", "snapshot", "-r", tmp, snap_path])
-    run(["btrfs", "subvolume", "delete", tmp])
-    click.echo(f"Created snapshot: {snap_path}")
-    update_current_link(local_root)
+    commit_snapshot(tmp, snap_path, local_root)
 
 
 # ---- remote -------------------------------------------------------------------
+
 
 @cli.command("remote")
 @local_root_option
@@ -661,13 +886,14 @@ def remote_backup(local_root: Path, remote_root: Path) -> None:
     finally:
         if not success and target.exists():
             click.echo("Removing the partially received subvolume on the remote.", err=True)
-            subprocess.run(["btrfs", "subvolume", "delete", str(target)])
+            subprocess.run(["btrfs", "subvolume", "delete", str(target)], check=False)
 
     write_marker(local_root, newest.name)
     click.echo(f"Sent {newest.name} to {remote_root}")
 
 
 # ---- delete-local -------------------------------------------------------------
+
 
 @cli.command("delete-local")
 @local_root_option

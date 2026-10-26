@@ -10,7 +10,11 @@ dependencies = ["click>=8.0"]
 btrfs-backup = "btrfs_backup.cli:cli"
 
 [dependency-groups]
-dev = ["mypy>=1.10", "ruff>=0.5"]
+dev = [
+    "mypy>=1.10",
+    "prek>=0.5.7",
+    "ruff>=0.5",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -26,10 +30,62 @@ packages = ["src/btrfs_backup"]
 [tool.mypy]
 strict = true
 python_version = "3.10"
+files = ["src"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+src = ["src"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings (incl. W505 doc line length)
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "D",    # pydocstyle (docstrings)
+    "UP",   # pyupgrade
+    "FA",   # future annotations
+    "B",    # bugbear
+    "A",    # builtins shadowing
+    "C4",   # comprehensions
+    "C90",  # mccabe complexity
+    "SIM",  # simplify
+    "PIE",  # misc lints
+    "PTH",  # use pathlib
+    "PERF", # performance anti-patterns
+    "PL",   # pylint
+    "RUF",  # ruff specific
+    "S",    # bandit (security)
+    "T20",  # no print
+    "ERA",  # commented-out code
+    "ARG",  # unused arguments
+]
+ignore = [
+    "SIM108",  # explicit if/else blocks are preferred over ternary expressions
+    "S603",    # subprocess is only called with fixed argument lists, never through a shell
+    "S607",    # tools like btrfs, rsync, install are looked up via PATH on purpose
+    "PLR0913", # click commands take one argument per option
+]
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+known-first-party = ["btrfs_backup"]
+combine-as-imports = true
+lines-after-imports = 2
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 100
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15

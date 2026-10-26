@@ -29,9 +29,14 @@ points to the newest snapshot. Failed or killed runs stay behind as
 ```bash
 uv sync
 uv run btrfs-backup --help
-uv run ruff check
-uv run mypy
+uv run prek install            # install the git pre-commit hook
+uv run prek run --all-files    # run all hooks once
 ```
+
+[prek](https://github.com/j178/prek) runs the hooks from `.pre-commit-config.yaml`: whitespace
+and file hygiene checks, `ruff check --fix` (rules and isort settings in `pyproject.toml`,
+including docstring checks), `ruff format`, `uv lock` consistency and `mypy --strict`.
+Each hook can also be run directly: `uv run ruff check`, `uv run ruff format`, `uv run mypy`.
 
 ## Install system-wide
 
