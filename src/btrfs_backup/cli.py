@@ -47,7 +47,7 @@ from typing import Any
 import click
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 INSTALL_DEST = Path("/usr/local/sbin/btrfs-backup")
 SYSTEM_PYTHON = "/usr/bin/python3"
