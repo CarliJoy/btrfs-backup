@@ -5,6 +5,46 @@ description = "Backup chain: ext4 source -> local btrfs (rsync + snapshots) -> r
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["click>=8.0"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Carli* Freudenberg", email = "kound@posteo.de" },
+]
+keywords = [
+    "backup",
+    "btrfs",
+    "snapshot",
+    "rsync",
+    "btrfs-send",
+    "bitrot",
+    "scrub",
+    "systemd",
+    "cli",
+    "linux",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Natural Language :: English",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: System :: Filesystems",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/CarliJoy/btrfs-backup"
+Documentation = "https://github.com/CarliJoy/btrfs-backup/blob/main/README.md"
+Changelog = "https://github.com/CarliJoy/btrfs-backup/blob/main/CHANGELOG.md"
+Issues = "https://github.com/CarliJoy/btrfs-backup/issues"
+"Source Code" = "https://github.com/CarliJoy/btrfs-backup"
 
 [project.scripts]
 btrfs-backup = "btrfs_backup.cli:cli"
