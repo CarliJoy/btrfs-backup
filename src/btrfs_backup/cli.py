@@ -17,6 +17,7 @@ Subcommands:
     remote         Send all local snapshots missing on the remote disk, oldest first (incremental).
     delete-local   Safely delete a local snapshot (refuses if not yet sent to the remote).
     install        Install this script system-wide with 'sudo install' (run as a normal user).
+    install-timer  Run the local backup once a day (systemd timer, caught up at boot).
 
 The rsync filter rules live only in /etc/btrfs-backup.filter (single source of
 truth). The file must exist, otherwise `local` refuses to run.
@@ -50,6 +51,12 @@ __version__ = "0.1.0"
 
 INSTALL_DEST = Path("/usr/local/sbin/btrfs-backup")
 SYSTEM_PYTHON = "/usr/bin/python3"
+
+# systemd units written by install-timer (only the local backup runs automatically: the
+# remote disk is usually not connected).
+SYSTEMD_DIR = Path("/etc/systemd/system")
+UNIT_NAME = "btrfs-backup-local"
+DEFAULT_ON_CALENDAR = "*-*-* 04:00:00"  # every day at 04:00
 
 SNAP_PREFIX = "backup_"
 SNAP_DATE_FMT = "%Y%m%d_%H%M%S"
@@ -661,6 +668,118 @@ def install_command(dest: Path, python_path: str) -> None:
             ]
         )
     click.echo(f"Installed {dest}")
+
+
+# ---- install-timer ------------------------------------------------------------
+
+
+def check_calendar(value: str) -> None:
+    """Let systemd validate a calendar expression such as ``*-*-* 04:00:00``.
+
+    Raises:
+        click.ClickException: If ``systemd-analyze`` does not accept the value.
+    """
+    result = subprocess.run(
+        ["systemd-analyze", "calendar", value], capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        raise click.ClickException(
+            f"--on-calendar: {value!r} is not a systemd calendar expression."
+        )
+
+
+def render_service_unit(exe: Path, local_root: Path) -> str:
+    """Return the text of the systemd service that runs one local backup.
+
+    The backup runs at low CPU and idle I/O priority so the computer stays usable, and
+    without a time limit because the first run can take hours.
+
+    Args:
+        exe: The installed ``btrfs-backup`` script.
+        local_root: The local backup disk, passed explicitly to the ``local`` command.
+
+    Returns:
+        The content of the ``.service`` file.
+    """
+    lines = (
+        "[Unit]",
+        "Description=btrfs-backup: local snapshot backup",
+        f"RequiresMountsFor={local_root}",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        f"ExecStart={exe} local --local-root {local_root}",
+        "TimeoutStartSec=infinity",
+        "Nice=10",
+        "IOSchedulingClass=idle",
+        "",
+    )
+    return "\n".join(lines)
+
+
+def render_timer_unit(on_calendar: str) -> str:
+    """Return the text of the systemd timer: once a day, caught up at boot if it was missed.
+
+    ``Persistent=true`` makes systemd remember the last run. If the computer was off at the
+    scheduled time, the backup starts as soon as the timer starts at boot. However often
+    the computer is rebooted, there is at most one run per scheduled time.
+
+    Args:
+        on_calendar: A systemd calendar expression, e.g. ``*-*-* 04:00:00``.
+
+    Returns:
+        The content of the ``.timer`` file.
+    """
+    lines = (
+        "[Unit]",
+        "Description=btrfs-backup: run the local backup once a day",
+        "",
+        "[Timer]",
+        f"OnCalendar={on_calendar}",
+        "Persistent=true",
+        "",
+        "[Install]",
+        "WantedBy=timers.target",
+        "",
+    )
+    return "\n".join(lines)
+
+
+@cli.command("install-timer")
+@local_root_option
+@click.option(
+    "--on-calendar",
+    default=DEFAULT_ON_CALENDAR,
+    show_default=True,
+    help="When to run, as a systemd calendar expression (see 'man systemd.time').",
+)
+def install_timer(local_root: Path, on_calendar: str) -> None:
+    """Run the local backup once a day with a systemd timer (needs root).
+
+    If the computer is off at the scheduled time, the backup starts right after the next
+    boot, when no other programs are running yet. Rebooting several times a day does not
+    start more backups. Only the local backup runs automatically. Run 'install' first, so
+    the unit can call the installed script. Running this command again updates the timer.
+    """
+    require_root()
+    if not INSTALL_DEST.exists():
+        raise click.ClickException(f"{INSTALL_DEST} not found. Run 'btrfs-backup install' first.")
+    if any(char.isspace() for char in str(local_root)):
+        raise click.ClickException(f"Spaces in {local_root} are not supported in the unit file.")
+    check_calendar(on_calendar)
+
+    service_path = SYSTEMD_DIR / (UNIT_NAME + ".service")
+    timer_path = SYSTEMD_DIR / (UNIT_NAME + ".timer")
+    service_path.write_text(render_service_unit(INSTALL_DEST, local_root))
+    timer_path.write_text(render_timer_unit(on_calendar))
+    click.echo(f"Wrote {service_path} and {timer_path}")
+
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", timer_path.name])
+    # restart (not just start) so that changed values apply when the timer already runs
+    run(["systemctl", "restart", timer_path.name])
+    run(["systemctl", "list-timers", "--no-pager", timer_path.name])
+    click.echo(f"Follow the log with: journalctl -u {service_path.name} -f")
 
 
 # ---- init-local ---------------------------------------------------------------

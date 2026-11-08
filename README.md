@@ -53,14 +53,57 @@ been sent to the remote disk yet.
 
 ## Commands
 
-| Command        | Purpose                                                              |
-|----------------|----------------------------------------------------------------------|
-| `init-local`   | Prepare the local backup disk (creates `.snapshots`)                 |
-| `init-remote`  | Check that the remote disk is a mounted btrfs filesystem             |
-| `local`        | rsync SOURCE into a new snapshot on the local disk                   |
-| `remote`       | Send all snapshots missing on the remote disk, oldest first (incremental) |
-| `delete-local` | Delete a local snapshot, refusing if it was not sent to the remote   |
-| `install`      | Install the script to `/usr/local/sbin/btrfs-backup` via `sudo install` |
+| Command         | Purpose                                                              |
+|-----------------|----------------------------------------------------------------------|
+| `init-local`    | Prepare the local backup disk (creates `.snapshots`)                 |
+| `init-remote`   | Check that the remote target lies on a mounted btrfs filesystem      |
+| `local`         | rsync SOURCE into a new snapshot on the local disk                   |
+| `remote`        | Send all snapshots missing on the remote disk, oldest first (incremental) |
+| `delete-local`  | Delete a local snapshot, refusing if it was not sent to the remote   |
+| `install`       | Install the script to `/usr/local/sbin/btrfs-backup` via `sudo install` |
+| `install-timer` | Run the local backup once a day with a systemd timer                 |
+
+### Default paths and the primary user
+
+The primary user is the user with UID 1000, normally the main user of the computer.
+`--local-root` defaults to `/media/<USER>/ssd-backup` and `--remote-root` to
+`/media/<USER>/8tb/Backups/from-ssd`, where `<USER>` is the primary user.
+Both can be changed with the options.
+The remote root may be a folder on the backup disk, it does not have to be the mountpoint.
+It only has to lie on a mounted btrfs filesystem, never on the root filesystem.
+
+`local --primary-user` selects another user.
+The per-user exports are done for this user only: the flatpak list and remotes
+(`flatpak-user.txt`, `flatpak-remotes-user.txt`) and the `uv tool` installs
+(`uv-tools-restore.sh`).
+System-wide lists are always saved.
+
+### Lists and restore scripts
+
+Every backup contains these files in `/root/backup-lists`, written before the copy starts:
+`manual-packages.txt` (apt), `snaps.txt`, the flatpak lists, `ollama-restore.sh`,
+`huggingface-restore.sh` and `uv-tools-restore.sh`.
+The scripts only call the tools again, for example `uv tool install --with click ruff`.
+For `uv tool` the `--with` packages are kept, extras of the tool itself are not.
+
+### Running it automatically
+
+```bash
+sudo btrfs-backup install-timer                          # every day at 04:00
+sudo btrfs-backup install-timer --on-calendar '*-*-* 12:00:00'
+```
+
+This writes `btrfs-backup-local.service` and `.timer` to `/etc/systemd/system` and enables the
+timer.
+Only the local backup runs automatically, because the remote disk is usually not connected.
+The timer uses `Persistent=true`: if the computer was off at the scheduled time, the backup
+starts when the timer comes up at boot, before other programs are running.
+Rebooting several times a day does not start more backups.
+The service waits for the backup disk to be mounted and runs with low CPU and idle I/O
+priority.
+Run `btrfs-backup install` first, because the service calls the installed script.
+Follow a run with `journalctl -u btrfs-backup-local.service -f`, and switch the timer off with
+`sudo systemctl disable --now btrfs-backup-local.timer`.
 
 ### How `remote` decides what to send
 
@@ -94,7 +137,7 @@ access or a user environment, for example when restoring from a live USB.
 ```bash
 sudo apt install python3-click rsync btrfs-progs
 uv run btrfs-backup install          # runs: sudo install -D -m 755 ... /usr/local/sbin/btrfs-backup
-sudo btrfs-backup local --local-root /media/kound/ssd-backup --dry-run
+sudo btrfs-backup local --dry-run
 ```
 
 `install` copies the single self-contained file `src/btrfs_backup/cli.py` and replaces its
@@ -106,7 +149,8 @@ Run it again after every change to update the installed copy.
 - `/etc/btrfs-backup.filter`: rsync filter rules, must exist (single source of truth;
   `local --filter-file` selects another file).
 - Root for everything except `install`.
-- `btrfs-progs`, `rsync`; for per-user flatpak lists `runuser` (util-linux).
+- `btrfs-progs`, `rsync`; `runuser` (util-linux) and `uv` for the per-user lists;
+  `systemd` for `install-timer`.
 
 ## Not done yet
 
