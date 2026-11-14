@@ -18,36 +18,48 @@ Subcommands:
     delete-local   Safely delete a local snapshot (refuses if not yet sent to the remote).
     install        Install this script system-wide with 'sudo install' (run as a normal user).
     install-timer  Run the local backup once a day (systemd timer, caught up at boot).
+    install-remote-trigger
+                   Send to the encrypted external disk when it is plugged in (systemd).
 
 The rsync filter rules live only in /etc/btrfs-backup.filter (single source of
 truth). The file must exist, otherwise `local` refuses to run.
 
 Every backup contains a backup.log in its root (what was created/changed/deleted,
 timestamps, duration). Failed or killed runs are kept as .backup_inprogress_<time>.
+Snapshot names and log times are in UTC, marked by a trailing Z.
+
+With --notify, `local` and `remote` report their result to the desktop of the primary
+user (notify-send, started through systemd-run in that user's session).
 
 Requires: btrfs-progs, rsync, click  (apt install btrfs-progs rsync python3-click)
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import pwd
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Sequence
-from datetime import datetime, timedelta
+import uuid
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
-from typing import Any
+from types import FrameType
+from typing import Any, NamedTuple, NoReturn
 
 import click
 
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"
 
 INSTALL_DEST = Path("/usr/local/sbin/btrfs-backup")
 SYSTEM_PYTHON = "/usr/bin/python3"
@@ -58,22 +70,44 @@ SYSTEMD_DIR = Path("/etc/systemd/system")
 UNIT_NAME = "btrfs-backup-local"
 DEFAULT_ON_CALENDAR = "*-*-* 04:00:00"  # every day at 04:00
 
+# install-remote-trigger: the external disk is a LUKS partition (crypttab) with btrfs inside
+# (fstab). The tuples below are field positions in those two files.
+CRYPTTAB = Path("/etc/crypttab")
+FSTAB = Path("/etc/fstab")
+REMOTE_UNIT_NAME = "btrfs-backup-remote"
+EXAMPLE_MAPPER_NAME = "8tb"
+LUKS_TYPE = "crypto_LUKS"
+BY_UUID_DIR = Path("/dev/disk/by-uuid")
+MAPPER_NAME = re.compile(r"[A-Za-z0-9_-]+")
+GROUP_OTHER_BITS = 0o077
+CRYPTTAB_NAME, CRYPTTAB_DEVICE, CRYPTTAB_KEY, CRYPTTAB_OPTIONS = 0, 1, 2, 3
+FSTAB_DEVICE, FSTAB_MOUNT_POINT, FSTAB_TYPE, FSTAB_OPTIONS = 0, 1, 2, 3
+
 SNAP_PREFIX = "backup_"
-SNAP_DATE_FMT = "%Y%m%d_%H%M%S"
+# Snapshot names and log lines use UTC, marked by a trailing Z. Names without the Z come
+# from older versions (local time) and still sort correctly next to the new ones.
+SNAP_DATE_FMT = "%Y%m%d_%H%M%SZ"
 SNAP_DIR_NAME = ".snapshots"
 MARKER_FILE = ".last_sent_snapshot"
 INPROGRESS_PREFIX = ".backup_inprogress_"
 CURRENT_LINK_NAME = "current"
 LOG_FILE_NAME = "backup.log"  # lives in the root of every backup (and snapshot)
-LOG_TIME_FMT = "%Y-%m-%d %H:%M:%S"
+LOG_TIME_FMT = "%Y-%m-%d %H:%M:%SZ"
 # rsync always starts its own log lines with "YYYY/MM/DD HH:MM:SS [pid] " (not configurable,
-# --log-file-format only changes what follows), so those dates are rewritten after the run.
-RSYNC_LOG_DATE = re.compile(rb"^(\d{4})/(\d{2})/(\d{2}) ")
+# --log-file-format only changes what follows), so they are rewritten after the run to
+# "YYYY-MM-DD HH:MM:SSZ [pid] " (rsync runs with TZ=UTC).
+RSYNC_LOG_DATE = re.compile(rb"^(\d{4})/(\d{2})/(\d{2}) (\d{2}:\d{2}:\d{2}) ")
 
 LogFn = Callable[[str], None]
 
 DEFAULT_FILTER_FILE = Path("/etc/btrfs-backup.filter")
 LISTS_DIR = Path("/root/backup-lists")
+FLATPAK_LIST_FILES = (
+    "flatpak-system.txt",
+    "flatpak-remotes-system.txt",
+    "flatpak-user.txt",
+    "flatpak-remotes-user.txt",
+)
 
 # The primary user is the one with this UID (the first normal user, UID 1000 on Ubuntu).
 # Its per-user exports (flatpak, uv tools) are saved and the default disk paths use its name.
@@ -86,10 +120,47 @@ REMOTE_ROOT_SUBPATH = "8tb/Backups/from-ssd"  # default: /media/<USER>/8tb/Backu
 # 0 = ok, 24 = "some source files vanished" (normal when copying a live system)
 RSYNC_VANISHED_CODE = 24
 RSYNC_OK_CODES = (0, RSYNC_VANISHED_CODE)
+# 23 = "some files could not be transferred": the snapshot is kept, with a warning.
+RSYNC_PARTIAL_CODE = 23
+
+# One lock file per kind of job, so that the same job never runs twice at the same time.
+LOCK_DIR = Path("/run/lock")
+NOTIFY_APP_NAME = "btrfs-backup"
 
 # Ollama manifests live in manifests/<registry>/<namespace>/<model>/<tag>.
 MIN_MANIFEST_PARTS = 3  # registry, model, tag (the namespace can be missing)
 LIBRARY_MODEL_PARTS = 2  # "library" and the model name
+
+
+class Notice(NamedTuple):
+    """How a desktop notification looks: urgency, icon, category and whether it is kept."""
+
+    urgency: str
+    icon: str
+    category: str
+    transient: bool
+
+
+class Outcome(NamedTuple):
+    """Result of a finished job: one line for the user, plus warnings if there are any."""
+
+    message: str
+    warnings: tuple[str, ...]
+
+
+class RsyncResult(NamedTuple):
+    """How the rsync run ended: usable or not, a short description, and warnings."""
+
+    success: bool
+    detail: str
+    warnings: tuple[str, ...]
+
+
+# Success: a normal banner that is not kept in the notification list. "low" would not
+# show a banner at all on GNOME. Warnings stay in the list, errors stay until dismissed.
+NOTICE_OK = Notice("normal", "kfloppy", "transfer.complete", True)
+NOTICE_WARNING = Notice("normal", "dialog-warning", "transfer.complete", False)
+NOTICE_ERROR = Notice("critical", "dialog-error", "transfer.error", False)
 
 
 # ---- helpers ----------------------------------------------------------------
@@ -105,12 +176,126 @@ def require_root() -> None:
         raise click.ClickException("This command must be run as root (use sudo).")
 
 
+def utc_now() -> datetime:
+    """Return the current time in UTC (used for snapshot names and log lines)."""
+    return datetime.now(timezone.utc)
+
+
+def format_duration(seconds: float) -> str:
+    """Format a duration for people, e.g. ``45 s``, ``3 min 12 s`` or ``1 h 05 min``."""
+    hours, rest = divmod(round(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    if minutes:
+        return f"{minutes} min {secs:02d} s"
+    return f"{secs} s"
+
+
+def raise_terminated(signum: int, _frame: FrameType | None) -> NoReturn:
+    """Turn SIGTERM into an exception, so that logs are finished and partial work is removed."""
+    raise SystemExit(128 + signum)
+
+
+def send_notice(user: str | None, notice: Notice, summary: str, body: str) -> None:
+    """Show a desktop notification to ``user`` with notify-send; never fails.
+
+    Root has no access to the user's session, so the command runs inside the user's
+    systemd instance (``systemd-run --machine=<user>@.host --user``). If the user is not
+    logged in, the notification is skipped with a note.
+
+    Args:
+        user: Who to notify, or None to send nothing.
+        notice: Urgency, icon and category.
+        summary: The title line.
+        body: The text below it.
+    """
+    if user is None:
+        return
+    hints: tuple[str, ...] = ()
+    if notice.transient:
+        hints = ("--hint=int:transient:1",)
+    cmd = (
+        "systemd-run",
+        f"--machine={user}@.host",
+        "--user",
+        "--quiet",
+        "--collect",
+        "notify-send",
+        f"--app-name={NOTIFY_APP_NAME}",
+        f"--urgency={notice.urgency}",
+        f"--icon={notice.icon}",
+        f"--category={notice.category}",
+        *hints,
+        summary,
+        body,
+    )
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError as error:
+        click.echo(f"Note: could not notify {user}: {error}", err=True)
+        return
+    if result.returncode != 0:
+        click.echo(f"Note: could not notify {user}: {result.stderr.strip()}", err=True)
+
+
+@contextlib.contextmanager
+def exclusive_lock(name: str) -> Iterator[None]:
+    """Hold a lock so that the same kind of job cannot run twice at the same time.
+
+    Args:
+        name: ``local`` or ``remote``; the lock file is ``/run/lock/btrfs-backup-<name>.lock``.
+
+    Raises:
+        click.ClickException: If another process holds the lock.
+    """
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    with (LOCK_DIR / f"btrfs-backup-{name}.lock").open("w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise click.ClickException(
+                f"'btrfs-backup {name}' is running right now, try again when it has finished."
+            ) from None
+        yield
+
+
+def run_job(
+    lock_name: str, title: str, notify_user: str | None, job: Callable[[], Outcome]
+) -> None:
+    """Run a backup job under its lock and report the result.
+
+    Args:
+        lock_name: Name for ``exclusive_lock``.
+        title: Start of the notification title, e.g. ``Local backup``.
+        notify_user: User who gets a desktop notification, or None for no notifications.
+        job: Does the work and returns its outcome; errors are raised.
+    """
+    begin = time.monotonic()
+    try:
+        with exclusive_lock(lock_name):
+            outcome = job()
+    except click.ClickException as error:
+        send_notice(notify_user, NOTICE_ERROR, f"{title} failed", error.message)
+        raise
+    except Exception as error:
+        send_notice(notify_user, NOTICE_ERROR, f"{title} failed", f"Unexpected error: {error!r}")
+        raise
+    took = f"Took {format_duration(time.monotonic() - begin)}."
+    click.echo(outcome.message)
+    if outcome.warnings:
+        body = "\n".join((outcome.message, took, *outcome.warnings))
+        send_notice(notify_user, NOTICE_WARNING, f"{title} finished with warnings", body)
+    else:
+        send_notice(notify_user, NOTICE_OK, f"{title} finished", f"{outcome.message}\n{took}")
+
+
 def start_log(log_path: Path, first_message: str) -> LogFn:
     """Overwrite the log with a first line and return a function that logs to file and terminal."""
 
     def log(message: str) -> None:
-        """Print a timestamped line and append it to the log file."""
-        line = datetime.now().strftime(LOG_TIME_FMT) + " " + message
+        """Print a timestamped line (UTC) and append it to the log file."""
+        line = utc_now().strftime(LOG_TIME_FMT) + " " + message
         click.echo(line)
         with log_path.open("a") as handle:
             handle.write(line + "\n")
@@ -127,22 +312,33 @@ def run(
 
     Args:
         cmd: Program and arguments; paths are converted to strings.
-        check: Raise ``CalledProcessError`` on a non-zero exit code.
+        check: Fail on a non-zero exit code.
         **kwargs: Passed through to ``subprocess.run``.
 
     Returns:
         The completed process.
+
+    Raises:
+        click.ClickException: If the program is missing, or fails while ``check`` is set.
     """
-    args = [str(c) for c in cmd]
+    args = tuple(str(c) for c in cmd)
     click.echo("$ " + " ".join(args))
-    return subprocess.run(args, check=check, **kwargs)
+    try:
+        return subprocess.run(args, check=check, **kwargs)
+    except FileNotFoundError:
+        raise click.ClickException(f"Command not found: {args[0]}") from None
+    except subprocess.CalledProcessError as error:
+        raise click.ClickException(
+            f"Command failed with exit code {error.returncode}: {' '.join(args)}"
+        ) from None
 
 
 def run_pipe(send_cmd: Sequence[str], receive_cmd: Sequence[str]) -> None:
     """Run ``send_cmd | receive_cmd`` and fail if either side fails.
 
     Used for ``btrfs send | btrfs receive``. Both exit codes are checked, whereas a plain
-    shell pipe only reports the last one.
+    shell pipe only reports the last one. When one side dies the other one usually fails
+    too, so the error names both exit codes instead of blaming one side.
 
     Args:
         send_cmd: Command whose stdout is piped into the receiver.
@@ -153,15 +349,21 @@ def run_pipe(send_cmd: Sequence[str], receive_cmd: Sequence[str]) -> None:
     """
     click.echo("$ " + " ".join(send_cmd) + " | " + " ".join(receive_cmd))
     send = subprocess.Popen(send_cmd, stdout=subprocess.PIPE)
-    receive = subprocess.Popen(receive_cmd, stdin=send.stdout)
+    try:
+        receive = subprocess.Popen(receive_cmd, stdin=send.stdout)
+    except OSError as error:
+        send.kill()
+        send.wait()
+        raise click.ClickException(f"Could not start {receive_cmd[0]}: {error}") from None
     if send.stdout is not None:
         send.stdout.close()
     receive.communicate()
     send.wait()
-    if send.returncode != 0:
-        raise click.ClickException("btrfs send failed")
-    if receive.returncode != 0:
-        raise click.ClickException("btrfs receive failed")
+    if send.returncode != 0 or receive.returncode != 0:
+        raise click.ClickException(
+            f"Sending failed (btrfs send exit code {send.returncode}, "
+            f"btrfs receive exit code {receive.returncode})."
+        )
 
 
 def ensure_mounted_btrfs(path: Path) -> None:
@@ -288,6 +490,13 @@ def default_remote_root() -> Path:
     return MEDIA_DIR / primary_user() / REMOTE_ROOT_SUBPATH
 
 
+def remove_stale(path: Path, log: LogFn) -> None:
+    """Remove a list or restore script of an earlier run that no longer applies."""
+    if path.exists():
+        path.unlink()
+        log(f"Removed outdated {path}")
+
+
 def save_package_lists(user: str, log: LogFn) -> None:
     """Write lists of installed packages/flatpaks into LISTS_DIR (part of the backup).
 
@@ -300,8 +509,12 @@ def save_package_lists(user: str, log: LogFn) -> None:
 
     if shutil.which("apt-mark"):
         jobs.append(("manual-packages.txt", ["apt-mark", "showmanual"]))
+    else:
+        remove_stale(LISTS_DIR / "manual-packages.txt", log)
     if shutil.which("snap"):
         jobs.append(("snaps.txt", ["snap", "list"]))
+    else:
+        remove_stale(LISTS_DIR / "snaps.txt", log)
 
     if shutil.which("flatpak"):
         jobs.append(
@@ -331,6 +544,8 @@ def save_package_lists(user: str, log: LogFn) -> None:
         )
     else:
         log("flatpak not installed, skipping flatpak lists.")
+        for name in FLATPAK_LIST_FILES:
+            remove_stale(LISTS_DIR / name, log)
 
     for filename, cmd in jobs:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -404,11 +619,11 @@ def huggingface_repos() -> list[str]:
 
 
 def normalize_rsync_log_dates(log_path: Path) -> None:
-    """Rewrite the leading YYYY/MM/DD of rsync's log lines to YYYY-MM-DD (binary safe)."""
+    """Rewrite rsync's ``YYYY/MM/DD HH:MM:SS`` line prefix to ``YYYY-MM-DD HH:MM:SSZ``."""
     staged = log_path.with_name(log_path.name + ".tmp")
     with log_path.open("rb") as source, staged.open("wb") as target:
         for line in source:
-            target.write(RSYNC_LOG_DATE.sub(rb"\1-\2-\3 ", line, count=1))
+            target.write(RSYNC_LOG_DATE.sub(rb"\1-\2-\3 \4Z ", line, count=1))
     staged.replace(log_path)
 
 
@@ -430,7 +645,7 @@ def write_restore_script(path: Path, comment: str, body_lines: Iterable[str], lo
 def save_model_restore_scripts(extra_ollama_dirs: Iterable[Path], log: LogFn) -> None:
     """Write shell scripts that re-download the locally stored AI models."""
     LISTS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    stamp = utc_now().strftime("%Y-%m-%d %H:%M UTC")
 
     refs = ollama_refs(find_ollama_manifest_dirs(extra_ollama_dirs))
     if refs:
@@ -438,12 +653,13 @@ def save_model_restore_scripts(extra_ollama_dirs: Iterable[Path], log: LogFn) ->
         lines.extend("ollama pull " + shlex.quote(ref) for ref in refs)
         write_restore_script(
             LISTS_DIR / "ollama-restore.sh",
-            f"Generated by btrfs_backup.py on {stamp}: re-download Ollama models.",
+            f"Generated by btrfs-backup on {stamp}: re-download Ollama models.",
             lines,
             log,
         )
     else:
         log("No Ollama models found, skipping ollama-restore.sh.")
+        remove_stale(LISTS_DIR / "ollama-restore.sh", log)
 
     repos = huggingface_repos()
     if repos:
@@ -454,12 +670,13 @@ def save_model_restore_scripts(extra_ollama_dirs: Iterable[Path], log: LogFn) ->
         lines.extend('"$HF" download ' + shlex.quote(repo) for repo in repos)
         write_restore_script(
             LISTS_DIR / "huggingface-restore.sh",
-            f"Generated by btrfs_backup.py on {stamp}: re-download Hugging Face models.",
+            f"Generated by btrfs-backup on {stamp}: re-download Hugging Face models.",
             lines,
             log,
         )
     else:
         log("No Hugging Face models found, skipping huggingface-restore.sh.")
+        remove_stale(LISTS_DIR / "huggingface-restore.sh", log)
 
 
 def uv_tool_install_lines(listing: str) -> list[str]:
@@ -489,6 +706,7 @@ def save_uv_tools_script(user: str, log: LogFn) -> None:
     uv = shutil.which("uv", path=f"{home}/.local/bin:{os.environ.get('PATH', os.defpath)}")
     if uv is None:
         log("uv not found, skipping uv-tools-restore.sh.")
+        remove_stale(LISTS_DIR / "uv-tools-restore.sh", log)
         return
     cmd = ["runuser", "-u", user, "--", "env", f"HOME={home}", uv, "tool", "list", "--show-with"]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -498,11 +716,12 @@ def save_uv_tools_script(user: str, log: LogFn) -> None:
     commands = uv_tool_install_lines(result.stdout)
     if not commands:
         log("No uv tools found, skipping uv-tools-restore.sh.")
+        remove_stale(LISTS_DIR / "uv-tools-restore.sh", log)
         return
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    stamp = utc_now().strftime("%Y-%m-%d %H:%M UTC")
     write_restore_script(
         LISTS_DIR / "uv-tools-restore.sh",
-        f"Generated by btrfs_backup.py on {stamp}: reinstall uv tools. Run as {user}.",
+        f"Generated by btrfs-backup on {stamp}: reinstall uv tools. Run as {user}.",
         commands,
         log,
     )
@@ -571,7 +790,7 @@ def build_rsync_command(
 
 
 def local_root_option(f: Callable[..., Any]) -> Callable[..., Any]:
-    """Add the required ``--local-root`` option to a click command."""
+    """Add the ``--local-root`` option (default: the primary user's disk) to a click command."""
     return click.option(
         "--local-root",
         default=default_local_root,
@@ -582,7 +801,7 @@ def local_root_option(f: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def remote_root_option(f: Callable[..., Any]) -> Callable[..., Any]:
-    """Add the required ``--remote-root`` option to a click command."""
+    """Add the ``--remote-root`` option (default: the primary user's disk) to a click command."""
     return click.option(
         "--remote-root",
         default=default_remote_root,
@@ -597,6 +816,7 @@ def remote_root_option(f: Callable[..., Any]) -> Callable[..., Any]:
 @click.version_option(__version__, prog_name="btrfs-backup")
 def cli() -> None:
     """Snapshot backups: SOURCE -> local (btrfs) -> remote (btrfs). Run as root."""
+    signal.signal(signal.SIGTERM, raise_terminated)
 
 
 # ---- install ------------------------------------------------------------------
@@ -673,6 +893,19 @@ def install_command(dest: Path, python_path: str) -> None:
 # ---- install-timer ------------------------------------------------------------
 
 
+def require_installed_script() -> None:
+    """Abort unless the script is installed, because the systemd units call that copy."""
+    if not INSTALL_DEST.exists():
+        raise click.ClickException(f"{INSTALL_DEST} not found. Run 'btrfs-backup install' first.")
+
+
+def require_no_spaces(*paths: Path) -> None:
+    """Abort if a path contains whitespace, which the generated unit files cannot hold."""
+    for path in paths:
+        if any(char.isspace() for char in str(path)):
+            raise click.ClickException(f"Spaces in {path} are not supported in the unit file.")
+
+
 def check_calendar(value: str) -> None:
     """Let systemd validate a calendar expression such as ``*-*-* 04:00:00``.
 
@@ -692,7 +925,8 @@ def render_service_unit(exe: Path, local_root: Path) -> str:
     """Return the text of the systemd service that runs one local backup.
 
     The backup runs at low CPU and idle I/O priority so the computer stays usable, and
-    without a time limit because the first run can take hours.
+    without a time limit because the first run can take hours. ``--notify`` shows the
+    result as a desktop notification.
 
     Args:
         exe: The installed ``btrfs-backup`` script.
@@ -708,7 +942,7 @@ def render_service_unit(exe: Path, local_root: Path) -> str:
         "",
         "[Service]",
         "Type=oneshot",
-        f"ExecStart={exe} local --local-root {local_root}",
+        f"ExecStart={exe} local --local-root {local_root} --notify",
         "TimeoutStartSec=infinity",
         "Nice=10",
         "IOSchedulingClass=idle",
@@ -762,10 +996,8 @@ def install_timer(local_root: Path, on_calendar: str) -> None:
     the unit can call the installed script. Running this command again updates the timer.
     """
     require_root()
-    if not INSTALL_DEST.exists():
-        raise click.ClickException(f"{INSTALL_DEST} not found. Run 'btrfs-backup install' first.")
-    if any(char.isspace() for char in str(local_root)):
-        raise click.ClickException(f"Spaces in {local_root} are not supported in the unit file.")
+    require_installed_script()
+    require_no_spaces(local_root)
     check_calendar(on_calendar)
 
     service_path = SYSTEMD_DIR / (UNIT_NAME + ".service")
@@ -779,6 +1011,306 @@ def install_timer(local_root: Path, on_calendar: str) -> None:
     # restart (not just start) so that changed values apply when the timer already runs
     run(["systemctl", "restart", timer_path.name])
     run(["systemctl", "list-timers", "--no-pager", timer_path.name])
+    click.echo(f"Follow the log with: journalctl -u {service_path.name} -f")
+
+
+# ---- install-remote-trigger ---------------------------------------------------
+
+
+def field(row: Sequence[str], index: int, default: str) -> str:
+    """Return ``row[index]``, or ``default`` if the row is shorter."""
+    if index < len(row):
+        return row[index]
+    return default
+
+
+def read_table(path: Path) -> tuple[tuple[str, ...], ...]:
+    """Read /etc/fstab or /etc/crypttab as rows of fields, without comments and empty lines.
+
+    A missing file gives no rows.
+    """
+    if not path.exists():
+        return ()
+    lines = (line.split("#", 1)[0].split() for line in path.read_text().splitlines())
+    return tuple(tuple(fields) for fields in lines if fields)
+
+
+def parse_luks_uuid(value: str) -> str:
+    """Return the UUID in lowercase from ``<uuid>``, ``UUID=<uuid>`` or a by-uuid path."""
+    candidate = Path(value.strip().removeprefix("UUID=")).name
+    try:
+        return str(uuid.UUID(candidate))
+    except ValueError:
+        raise click.ClickException(
+            f"{value!r} is not a UUID or a /dev/disk/by-uuid/<UUID> path."
+        ) from None
+
+
+def refers_to_uuid(device: str, luks_uuid: str) -> bool:
+    """Tell whether a crypttab device field points at the partition with ``luks_uuid``."""
+    return device.lower() in (f"uuid={luks_uuid}", f"/dev/disk/by-uuid/{luks_uuid}")
+
+
+def find_crypttab_entry(rows: Sequence[Sequence[str]], luks_uuid: str) -> Sequence[str] | None:
+    """Return the crypttab row of the partition with ``luks_uuid``, or None."""
+    for row in rows:
+        if len(row) > CRYPTTAB_DEVICE and refers_to_uuid(row[CRYPTTAB_DEVICE], luks_uuid):
+            return row
+    return None
+
+
+def find_fstab_entry(rows: Sequence[Sequence[str]], mapper_name: str) -> Sequence[str] | None:
+    """Return the fstab row that mounts ``/dev/mapper/<mapper_name>``, or None."""
+    devices = (f"/dev/mapper/{mapper_name}", f"/dev/disk/by-id/dm-name-{mapper_name}")
+    for row in rows:
+        if len(row) > FSTAB_TYPE and row[FSTAB_DEVICE] in devices:
+            return row
+    return None
+
+
+def blkid_type(device: Path) -> str:
+    """Return the content type of ``device`` as reported by blkid (empty if unknown)."""
+    result = subprocess.run(
+        ["blkid", "-s", "TYPE", "-o", "value", str(device)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+def disk_problems(luks_uuid: str) -> tuple[str, ...]:
+    """Check that the disk is connected and that the UUID belongs to a LUKS partition."""
+    device = BY_UUID_DIR / luks_uuid
+    if not device.exists():
+        return (
+            f"{device} does not exist. Connect the external disk, so that the UUID can be "
+            "verified.",
+        )
+    found = blkid_type(device)
+    if found == LUKS_TYPE:
+        return ()
+    return (
+        f"{device} contains {found!r}, not {LUKS_TYPE}. Use the UUID of the encrypted "
+        "partition, not the UUID of the filesystem inside it.",
+    )
+
+
+def crypttab_problems(entry: Sequence[str]) -> tuple[str, ...]:
+    """Check a crypttab row for an unattended unlock that does not block the boot."""
+    name = entry[CRYPTTAB_NAME]
+    key = field(entry, CRYPTTAB_KEY, "none")
+    options = field(entry, CRYPTTAB_OPTIONS, "").split(",")
+    problems: tuple[str, ...] = ()
+    if MAPPER_NAME.fullmatch(name) is None:
+        problems += (f"crypttab: name {name!r} may only contain letters, digits, - and _.",)
+    if key in ("none", "-"):
+        problems += (
+            f"crypttab: {name} has no key file, so it would ask for a passphrase. "
+            "Create one (see README) and put its path in the third field.",
+        )
+    elif not Path(key).is_file():
+        problems += (f"crypttab: the key file {key} does not exist.",)
+    elif Path(key).stat().st_mode & GROUP_OTHER_BITS:
+        problems += (
+            f"crypttab: the key file {key} is accessible by others, run: chmod 0400 {key}",
+        )
+    if "noauto" not in options and "nofail" not in options:
+        problems += (
+            f"crypttab: add the options noauto,nofail to {name}, "
+            "otherwise the boot waits for the disk when it is not plugged in.",
+        )
+    return problems
+
+
+def fstab_problems(entry: Sequence[str], remote_root: Path) -> tuple[str, ...]:
+    """Check an fstab row: btrfs, not mounted at boot, and the remote root lies below it."""
+    mount_point = Path(entry[FSTAB_MOUNT_POINT])
+    options = field(entry, FSTAB_OPTIONS, "defaults").split(",")
+    problems: tuple[str, ...] = ()
+    if entry[FSTAB_TYPE] != "btrfs":
+        problems += (
+            f"fstab: the type of {entry[FSTAB_DEVICE]} is {entry[FSTAB_TYPE]}, not btrfs.",
+        )
+    if "noauto" not in options:
+        problems += (
+            f"fstab: add the option noauto (and nofail) to {mount_point}, "
+            "because the disk is not unlocked yet at boot.",
+        )
+    if not remote_root.is_relative_to(mount_point):
+        problems += (
+            f"fstab: --remote-root {remote_root} does not lie below the mount point {mount_point}.",
+        )
+    return problems
+
+
+def fail_with(problems: Sequence[str]) -> NoReturn:
+    """Abort with all problems listed, one per line."""
+    raise click.ClickException("Nothing was installed:\n  - " + "\n  - ".join(problems))
+
+
+def systemd_escape(path: str, suffix: str) -> str:
+    """Return the unit name systemd uses for ``path``, e.g. ``dev-sda1.device``."""
+    result = subprocess.run(
+        ["systemd-escape", "-p", f"--suffix={suffix}", path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise click.ClickException(f"systemd-escape failed for {path}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def render_remote_service(
+    *,
+    exe: Path,
+    local_root: Path,
+    remote_root: Path,
+    luks_uuid: str,
+    mapper_name: str,
+    mount_point: Path,
+    device_unit: str,
+) -> str:
+    """Return the text of the service that unlocks, mounts and sends to the external disk.
+
+    It is started by the device unit when the disk appears. ``After=`` the local backup only
+    delays it while a local backup is running, it never starts one. The disk stays unlocked
+    and mounted afterwards: unmounting is left to the user.
+
+    Args:
+        exe: The installed ``btrfs-backup`` script.
+        local_root: The local backup disk.
+        remote_root: Directory on the external disk that receives the snapshots.
+        luks_uuid: UUID of the LUKS partition.
+        mapper_name: Name of the crypttab entry (``/dev/mapper/<name>``).
+        mount_point: Where fstab mounts the unlocked disk.
+        device_unit: systemd device unit of the LUKS partition.
+
+    Returns:
+        The content of the ``.service`` file.
+    """
+    crypt_unit = f"systemd-cryptsetup@{mapper_name}.service"
+    lines = (
+        "[Unit]",
+        "Description=btrfs-backup: send snapshots to the external disk",
+        f"ConditionPathExists=/dev/disk/by-uuid/{luks_uuid}",
+        f"BindsTo={device_unit}",
+        f"After={device_unit}",
+        f"Requires={crypt_unit}",
+        f"After={crypt_unit}",
+        f"RequiresMountsFor={mount_point} {local_root}",
+        f"After={UNIT_NAME}.service",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        f"ExecStart={exe} remote --local-root {local_root} --remote-root {remote_root} --notify",
+        "TimeoutStartSec=infinity",
+        "Nice=10",
+        "IOSchedulingClass=idle",
+        "",
+        "[Install]",
+        f"WantedBy={device_unit}",
+        "",
+    )
+    return "\n".join(lines)
+
+
+def render_local_dropin(luks_uuid: str) -> str:
+    """Return the drop-in for the local service that starts the remote service afterwards.
+
+    ``ExecStartPost`` of a oneshot service only runs after the backup succeeded. The remote
+    service is only started if the disk is plugged in: otherwise systemd would wait for the
+    missing device (90 seconds by default) and then report a failed unit. ``--no-block``
+    lets the local service finish first, and the leading ``-`` keeps a failing check or
+    start from turning a good backup into a failed one.
+
+    Args:
+        luks_uuid: UUID of the LUKS partition of the external disk.
+
+    Returns:
+        The content of the drop-in file.
+    """
+    check = (
+        f"test -e /dev/disk/by-uuid/{luks_uuid}"
+        f" && /usr/bin/systemctl --no-block start {REMOTE_UNIT_NAME}.service"
+    )
+    return f"[Service]\nExecStartPost=-/bin/sh -c '{check}'\n"
+
+
+@cli.command("install-remote-trigger")
+@click.argument("disk")
+@local_root_option
+@remote_root_option
+def install_remote_trigger(disk: str, local_root: Path, remote_root: Path) -> None:
+    """Send the snapshots when the encrypted external disk is plugged in (needs root).
+
+    DISK is the UUID of the LUKS partition (the UUID used in /etc/crypttab), given as plain
+    UUID or as /dev/disk/by-uuid/<UUID> path. The disk has to be connected, so that the
+    UUID can be verified.
+
+    /etc/crypttab and /etc/fstab are checked first, and nothing is installed if they are
+    not set up for an unattended unlock and mount. The service then unlocks and mounts the
+    disk and runs 'remote'. The disk stays mounted afterwards, unmount it yourself. The
+    service also runs after every successful local backup if the disk is plugged in, and
+    waits while a local backup is running. Run 'install' first, so the unit can call the
+    installed script.
+    """
+    require_root()
+    require_installed_script()
+    luks_uuid = parse_luks_uuid(disk)
+
+    crypttab_entry = find_crypttab_entry(read_table(CRYPTTAB), luks_uuid)
+    if crypttab_entry is None:
+        fail_with(
+            (
+                f"crypttab: no entry for UUID {luks_uuid} in {CRYPTTAB}. Add for example:\n"
+                f"      {EXAMPLE_MAPPER_NAME}  UUID={luks_uuid}  /root/.{EXAMPLE_MAPPER_NAME}.key"
+                "  luks,noauto,nofail",
+            )
+        )
+    mapper_name = crypttab_entry[CRYPTTAB_NAME]
+    problems = (*disk_problems(luks_uuid), *crypttab_problems(crypttab_entry))
+
+    fstab_entry = find_fstab_entry(read_table(FSTAB), mapper_name)
+    if fstab_entry is None:
+        fail_with(
+            (
+                *problems,
+                f"fstab: no entry for /dev/mapper/{mapper_name} in {FSTAB}. Add for example:\n"
+                f"      /dev/mapper/{mapper_name}  <mount point>  btrfs"
+                "  noauto,nofail,noatime,compress=zstd:6  0  0",
+            )
+        )
+    problems = (*problems, *fstab_problems(fstab_entry, remote_root))
+    if problems:
+        fail_with(problems)
+
+    mount_point = Path(fstab_entry[FSTAB_MOUNT_POINT])
+    require_no_spaces(local_root, remote_root, mount_point)
+    service_text = render_remote_service(
+        exe=INSTALL_DEST,
+        local_root=local_root,
+        remote_root=remote_root,
+        luks_uuid=luks_uuid,
+        mapper_name=mapper_name,
+        mount_point=mount_point,
+        device_unit=systemd_escape(f"/dev/disk/by-uuid/{luks_uuid}", "device"),
+    )
+    service_path = SYSTEMD_DIR / (REMOTE_UNIT_NAME + ".service")
+    service_path.write_text(service_text)
+
+    # After a successful local backup, start the remote service if the disk is plugged in.
+    # A drop-in survives re-running install-timer.
+    dropin_dir = SYSTEMD_DIR / (UNIT_NAME + ".service.d")
+    dropin_dir.mkdir(exist_ok=True)
+    dropin_path = dropin_dir / "remote.conf"
+    dropin_path.write_text(render_local_dropin(luks_uuid))
+    click.echo(f"Wrote {service_path} and {dropin_path}")
+
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", service_path.name])
+    click.echo(f"Test it with: sudo systemctl start {service_path.name}")
     click.echo(f"Follow the log with: journalctl -u {service_path.name} -f")
 
 
@@ -812,19 +1344,39 @@ def init_remote(remote_root: Path) -> None:
     click.echo(f"Remote target {remote_root} is ready to receive snapshots.")
 
 
-def warn_about_leftovers(local_root: Path) -> None:
-    """Warn about incomplete ``.backup_inprogress_*`` subvolumes left by earlier runs."""
-    for leftover in sorted(local_root.glob(INPROGRESS_PREFIX + "*")):
+def find_leftovers(local_root: Path) -> tuple[Path, ...]:
+    """Return incomplete ``.backup_inprogress_*`` subvolumes of earlier runs and warn about them."""
+    leftovers = tuple(sorted(local_root.glob(INPROGRESS_PREFIX + "*")))
+    for leftover in leftovers:
         click.echo(
             f"Warning: incomplete backup from an earlier run: {leftover} "
             f"(delete with 'btrfs subvolume delete {leftover}')",
             err=True,
         )
+    return leftovers
+
+
+def check_name_order(snapshots: Sequence[Path], new_name: str) -> None:
+    """Refuse a snapshot name that would not sort after the newest existing snapshot.
+
+    Everything relies on the names sorting by age. That can only break if the clock was set
+    back, or right after the switch from local time to UTC names.
+
+    Raises:
+        click.ClickException: If ``new_name`` does not sort after the newest snapshot.
+    """
+    if snapshots and new_name <= snapshots[-1].name:
+        raise click.ClickException(
+            f"The new snapshot {new_name} would not sort after the newest one "
+            f"({snapshots[-1].name}). Names are in UTC (trailing Z): if older snapshots are "
+            "named in local time or the clock was set back, run again once the UTC time has "
+            "passed the time in the newest name."
+        )
 
 
 def dry_run_backup(
     source: Path,
-    snapshots: list[Path],
+    snapshots: Sequence[Path],
     filter_file: Path,
     *,
     one_file_system: bool,
@@ -856,9 +1408,8 @@ def dry_run_backup(
             log_file=None,
         )
         result = run(command, check=False)
-    if result.returncode not in RSYNC_OK_CODES:
+    if result.returncode not in (*RSYNC_OK_CODES, RSYNC_PARTIAL_CODE):
         raise click.ClickException(f"rsync dry run failed with exit code {result.returncode}")
-    click.echo("Dry run only, nothing was changed.")
 
 
 def commit_snapshot(tmp: Path, snap_path: Path, local_root: Path) -> None:
@@ -875,7 +1426,7 @@ def commit_snapshot(tmp: Path, snap_path: Path, local_root: Path) -> None:
     update_current_link(local_root)
 
 
-def create_in_progress_subvolume(snapshots: list[Path], tmp: Path) -> str:
+def create_in_progress_subvolume(snapshots: Sequence[Path], tmp: Path) -> str:
     """Create the writable working subvolume for a new backup.
 
     It starts as a clone of the newest snapshot, so unchanged data stays shared via
@@ -893,6 +1444,136 @@ def create_in_progress_subvolume(snapshots: list[Path], tmp: Path) -> str:
         return f"started from old {snapshots[-1].name}"
     run(["btrfs", "subvolume", "create", tmp])
     return "started from scratch (no previous snapshot)"
+
+
+def copy_source(rsync_cmd: Sequence[str], log: LogFn) -> RsyncResult:
+    """Run rsync and judge its exit code.
+
+    rsync runs with ``TZ=UTC`` so that its log lines are in UTC like all other times.
+    Exit code 23 (some files could not be copied, for example unreadable ones) still gives
+    a snapshot, because a backup without a few files is better than none, but it is
+    reported as a warning.
+
+    Args:
+        rsync_cmd: The command from ``build_rsync_command``.
+        log: Logging function from ``start_log``.
+
+    Returns:
+        Whether the copy is usable, with a description and warnings.
+    """
+    log("$ " + " ".join(rsync_cmd))
+    code = subprocess.run(rsync_cmd, check=False, env={**os.environ, "TZ": "UTC"}).returncode
+    if code in RSYNC_OK_CODES:
+        if code == RSYNC_VANISHED_CODE:
+            log("Note: some files vanished during the copy (normal on a live system).")
+        return RsyncResult(True, f"rsync exit code {code}", ())
+    if code == RSYNC_PARTIAL_CODE:
+        warning = f"rsync could not copy some files (exit code {code}), see {LOG_FILE_NAME}."
+        log("Warning: " + warning)
+        return RsyncResult(True, f"rsync exit code {code}, some files were not copied", (warning,))
+    return RsyncResult(False, f"rsync failed with exit code {code}", ())
+
+
+def finish_log(log: LogFn, log_path: Path, started: str, result: RsyncResult, begin: float) -> None:
+    """Convert rsync's log dates and write the final line with the outcome and the duration."""
+    try:
+        normalize_rsync_log_dates(log_path)
+    except OSError as error:
+        log(f"Warning: could not convert rsync's log dates: {error}")
+    elapsed = str(timedelta(seconds=round(time.monotonic() - begin)))
+    if not result.success:
+        outcome = "FAILED"
+    elif result.warnings:
+        outcome = "OK WITH ERRORS"
+    else:
+        outcome = "OK"
+    log(f"Backup {started} {outcome} ({result.detail}), took {elapsed}")
+
+
+def perform_local_backup(
+    *,
+    local_root: Path,
+    source: Path,
+    filter_file: Path,
+    user: str,
+    ollama_dirs: Sequence[Path],
+    one_file_system: bool,
+    inplace: bool,
+    dry_run: bool,
+) -> Outcome:
+    """Do the work of the ``local`` command, see there.
+
+    Returns:
+        The created snapshot (or the dry run) as a message, with warnings about files that
+        could not be copied and about incomplete backups of earlier runs.
+    """
+    ensure_mounted_btrfs(local_root)
+
+    started = utc_now().strftime(SNAP_DATE_FMT)
+    snap_dir = local_root / SNAP_DIR_NAME
+    tmp = local_root / (INPROGRESS_PREFIX + started)
+    snap_path = snap_dir / (SNAP_PREFIX + started)
+
+    if not snap_dir.exists():
+        raise click.ClickException(f"{snap_dir} does not exist. Run init-local first.")
+    if tmp.exists() or snap_path.exists():
+        raise click.ClickException(
+            f"{tmp.name} or {snap_path.name} already exists, retry in a second."
+        )
+
+    leftovers = find_leftovers(local_root)
+    snapshots = list_snapshots(snap_dir)
+
+    if dry_run:
+        dry_run_backup(
+            source, snapshots, filter_file, one_file_system=one_file_system, inplace=inplace
+        )
+        return Outcome("Dry run only, nothing was changed.", ())
+
+    check_name_order(snapshots, snap_path.name)
+    origin = create_in_progress_subvolume(snapshots, tmp)
+
+    # First thing in the new backup: replace the log inherited from the old snapshot.
+    log_path = tmp / LOG_FILE_NAME
+    log = start_log(log_path, f"Backup {started} {origin}")
+    begin = time.monotonic()
+
+    result = RsyncResult(False, "aborted by an error or an interrupt", ())
+    try:
+        # Lists are written before the copy so they end up inside this snapshot.
+        save_package_lists(user, log)
+        save_model_restore_scripts(ollama_dirs, log)
+        save_uv_tools_script(user, log)
+
+        rsync_cmd = build_rsync_command(
+            source,
+            tmp,
+            filter_file,
+            one_file_system=one_file_system,
+            dry_run=False,
+            inplace=inplace,
+            log_file=log_path,
+        )
+        result = copy_source(rsync_cmd, log)
+    finally:
+        finish_log(log, log_path, started, result, begin)
+
+    if not result.success:
+        raise click.ClickException(
+            f"Backup failed ({result.detail}). The incomplete backup was kept at {tmp}, "
+            f"see {log_path}. Previous snapshots are untouched; delete the leftover with "
+            "'btrfs subvolume delete' when you no longer need it."
+        )
+
+    commit_snapshot(tmp, snap_path, local_root)
+
+    warnings = result.warnings
+    if leftovers:
+        warnings += (
+            f"{len(leftovers)} incomplete backup(s) of earlier runs are kept in {local_root}. "
+            "Delete them with 'btrfs subvolume delete' when you no longer need them.",
+        )
+    return Outcome(f"Snapshot {snap_path.name} created.", warnings)
 
 
 # ---- local --------------------------------------------------------------------
@@ -921,7 +1602,8 @@ def create_in_progress_subvolume(snapshots: list[Path], tmp: Path) -> str:
     show_default="the user with UID 1000",
     help="The main user of this computer. The per-user exports are done for this user only: "
     "its flatpak list and remotes (flatpak-user.txt, flatpak-remotes-user.txt) and its "
-    "uv tools (uv-tools-restore.sh). System-wide lists are always saved.",
+    "uv tools (uv-tools-restore.sh). System-wide lists are always saved. "
+    "This user also gets the notifications of --notify.",
 )
 @click.option(
     "--ollama-dir",
@@ -943,6 +1625,11 @@ def create_in_progress_subvolume(snapshots: list[Path], tmp: Path) -> str:
     help="Update changed files in place, block by block (saves space on btrfs).",
 )
 @click.option("--dry-run", is_flag=True, help="Show what rsync would change, create nothing.")
+@click.option(
+    "--notify",
+    is_flag=True,
+    help="Show a desktop notification to the primary user when the backup finished or failed.",
+)
 def local_backup(
     *,
     local_root: Path,
@@ -953,6 +1640,7 @@ def local_backup(
     one_file_system: bool,
     inplace: bool,
     dry_run: bool,
+    notify: bool,
 ) -> None:
     """Back up SOURCE into a new read-only snapshot on the local disk.
 
@@ -961,90 +1649,32 @@ def local_backup(
     partial snapshot behind: its timestamped .backup_inprogress_<time> subvolume is kept
     for inspection (with backup.log) and never blocks later runs. Delete it manually
     with 'btrfs subvolume delete'.
+
+    Snapshot names and log times are in UTC, marked by a trailing Z. If rsync could not
+    copy some files (exit code 23), the snapshot is still created and a warning is given.
     """
     require_root()
-    ensure_mounted_btrfs(local_root)
-
-    started = datetime.now().strftime(SNAP_DATE_FMT)
-    snap_dir = local_root / SNAP_DIR_NAME
-    tmp = local_root / (INPROGRESS_PREFIX + started)
-    snap_path = snap_dir / (SNAP_PREFIX + started)
-
-    if not snap_dir.exists():
-        raise click.ClickException(f"{snap_dir} does not exist. Run init-local first.")
-    if tmp.exists() or snap_path.exists():
-        raise click.ClickException(
-            f"{tmp.name} or {snap_path.name} already exists, retry in a second."
-        )
-
-    warn_about_leftovers(local_root)
-    snapshots = list_snapshots(snap_dir)
-
-    if dry_run:
-        dry_run_backup(
-            source, snapshots, filter_file, one_file_system=one_file_system, inplace=inplace
-        )
-        return
-
-    origin = create_in_progress_subvolume(snapshots, tmp)
-
-    # First thing in the new backup: replace the log inherited from the old snapshot.
-    log_path = tmp / LOG_FILE_NAME
-    log = start_log(log_path, f"Backup {started} {origin}")
-    begin = time.monotonic()
-
-    success = False
-    detail = "aborted by an error or an interrupt"
-    try:
-        # Lists are written before the copy so they end up inside this snapshot.
-        save_package_lists(primary_user_name, log)
-        save_model_restore_scripts(ollama_dir, log)
-        save_uv_tools_script(primary_user_name, log)
-
-        rsync_cmd = build_rsync_command(
-            source,
-            tmp,
-            filter_file,
-            one_file_system=one_file_system,
-            dry_run=False,
-            inplace=inplace,
-            log_file=log_path,
-        )
-        log("$ " + " ".join(rsync_cmd))
-        rsync_code = subprocess.run(rsync_cmd, check=False).returncode
-        if rsync_code in RSYNC_OK_CODES:
-            success = True
-            detail = f"rsync exit code {rsync_code}"
-            if rsync_code == RSYNC_VANISHED_CODE:
-                log("Note: some files vanished during the copy (normal on a live system).")
-        else:
-            detail = f"rsync failed with exit code {rsync_code}"
-    finally:
-        try:
-            normalize_rsync_log_dates(log_path)
-        except OSError as error:
-            log(f"Warning: could not convert rsync's log dates: {error}")
-        elapsed = str(timedelta(seconds=round(time.monotonic() - begin)))
-        if success:
-            outcome = "OK"
-        else:
-            outcome = "FAILED"
-        log(f"Backup {started} {outcome} ({detail}), took {elapsed}")
-
-    if not success:
-        raise click.ClickException(
-            f"Backup failed ({detail}). The incomplete backup was kept at {tmp}, "
-            f"see {log_path}. Previous snapshots are untouched; delete the leftover with "
-            "'btrfs subvolume delete' when you no longer need it."
-        )
-
-    commit_snapshot(tmp, snap_path, local_root)
+    notify_user = None
+    if notify and not dry_run:
+        notify_user = primary_user_name
+    job = partial(
+        perform_local_backup,
+        local_root=local_root,
+        source=source,
+        filter_file=filter_file,
+        user=primary_user_name,
+        ollama_dirs=ollama_dir,
+        one_file_system=one_file_system,
+        inplace=inplace,
+        dry_run=dry_run,
+    )
+    run_job("local", "Local backup", notify_user, job)
 
 
 # ---- remote -------------------------------------------------------------------
 
 
-def find_remote_parent(snapshots: list[Path], snapshot: Path, remote_root: Path) -> Path | None:
+def find_remote_parent(snapshots: Sequence[Path], snapshot: Path, remote_root: Path) -> Path | None:
     """Find the parent for an incremental send of ``snapshot``.
 
     Args:
@@ -1056,7 +1686,7 @@ def find_remote_parent(snapshots: list[Path], snapshot: Path, remote_root: Path)
         The newest local snapshot older than ``snapshot`` that also exists, complete, on the
         remote disk, or None if there is none (the send then has to be a full one).
     """
-    older = [s for s in snapshots if s.name < snapshot.name]
+    older = tuple(s for s in snapshots if s.name < snapshot.name)
     for candidate in reversed(older):
         if is_complete_subvolume(remote_root / candidate.name):
             return candidate
@@ -1077,14 +1707,15 @@ def send_snapshot(snapshot: Path, parent: Path | None, remote_root: Path) -> Non
         click.ClickException: If sending, receiving or the final check fails.
     """
     target = remote_root / snapshot.name
+    send_cmd: tuple[str, ...]
     if parent is None:
-        send_cmd = ["btrfs", "send", str(snapshot)]
+        send_cmd = ("btrfs", "send", str(snapshot))
     else:
-        send_cmd = ["btrfs", "send", "-p", str(parent), str(snapshot)]
+        send_cmd = ("btrfs", "send", "-p", str(parent), str(snapshot))
 
     success = False
     try:
-        run_pipe(send_cmd, ["btrfs", "receive", str(remote_root)])
+        run_pipe(send_cmd, ("btrfs", "receive", str(remote_root)))
         if not is_complete_subvolume(target):
             raise click.ClickException(f"{target} is not complete after receive.")
         success = True
@@ -1094,19 +1725,12 @@ def send_snapshot(snapshot: Path, parent: Path | None, remote_root: Path) -> Non
             subprocess.run(["btrfs", "subvolume", "delete", str(target)], check=False)
 
 
-@cli.command("remote")
-@local_root_option
-@remote_root_option
-def remote_backup(local_root: Path, remote_root: Path) -> None:
-    """Send all local snapshots that are missing on the remote disk.
+def perform_remote_backup(local_root: Path, remote_root: Path) -> Outcome:
+    """Do the work of the ``remote`` command, see there.
 
-    Snapshots newer than the last confirmed one are sent oldest first, each incrementally
-    against the newest older snapshot that exists on both disks (a full send if there is
-    none). The progress is recorded after every snapshot, so an interrupted run continues
-    where it stopped. Delete .last_sent_snapshot to check all snapshots again; those that
-    are already on the remote are skipped.
+    Returns:
+        What was sent, as a message.
     """
-    require_root()
     ensure_mounted_btrfs(local_root)
     ensure_mounted_btrfs(remote_root)
 
@@ -1119,10 +1743,10 @@ def remote_backup(local_root: Path, remote_root: Path) -> None:
     if last_sent is not None:
         pending = [s for s in snapshots if s.name > last_sent]
     if not pending:
-        click.echo(f"Nothing to send, {snapshots[-1].name} is already on the remote.")
-        return
+        return Outcome(f"Nothing to send, {snapshots[-1].name} is already on the remote.", ())
 
     click.echo(f"Sending {len(pending)} snapshot(s): " + ", ".join(s.name for s in pending))
+    sent = 0
     for snapshot in pending:
         target = remote_root / snapshot.name
         if target.exists():
@@ -1138,31 +1762,57 @@ def remote_backup(local_root: Path, remote_root: Path) -> None:
                 click.echo(f"No common parent for {snapshot.name}, performing a full send.")
             send_snapshot(snapshot, parent, remote_root)
             click.echo(f"Sent {snapshot.name} to {remote_root}")
+            sent += 1
         write_marker(local_root, snapshot.name)
+    return Outcome(f"Sent {sent} snapshot(s) to {remote_root}, newest: {pending[-1].name}.", ())
+
+
+@cli.command("remote")
+@local_root_option
+@remote_root_option
+@click.option(
+    "--notify",
+    is_flag=True,
+    help="Show a desktop notification to the user with UID 1000 when it finished or failed.",
+)
+def remote_backup(local_root: Path, remote_root: Path, notify: bool) -> None:
+    """Send all local snapshots that are missing on the remote disk.
+
+    Snapshots newer than the last confirmed one are sent oldest first, each incrementally
+    against the newest older snapshot that exists on both disks (a full send if there is
+    none). The progress is recorded after every snapshot, so an interrupted run continues
+    where it stopped. Delete .last_sent_snapshot to check all snapshots again; those that
+    are already on the remote are skipped.
+    """
+    require_root()
+    notify_user = None
+    if notify:
+        notify_user = primary_user()
+    run_job(
+        "remote",
+        "Remote backup",
+        notify_user,
+        partial(perform_remote_backup, local_root, remote_root),
+    )
 
 
 # ---- delete-local -------------------------------------------------------------
 
 
-@cli.command("delete-local")
-@local_root_option
-@click.argument("snapshot_name")
-@click.option("--force", is_flag=True, help="Delete even if not confirmed sent to the remote.")
-def delete_local(local_root: Path, snapshot_name: str, force: bool) -> None:
-    """Safely delete a local snapshot, refusing if it hasn't been sent to the remote yet."""
-    require_root()
+def perform_delete(local_root: Path, snapshot_name: str, force: bool) -> None:
+    """Do the work of the ``delete-local`` command, see there."""
     ensure_mounted_btrfs(local_root)
 
     snap_dir = local_root / SNAP_DIR_NAME
-    names = [s.name for s in list_snapshots(snap_dir)]
+    names = tuple(s.name for s in list_snapshots(snap_dir))
 
     if snapshot_name not in names:
         raise click.ClickException(f"{snapshot_name} is not a known backup snapshot.")
 
+    # The names sort by age, so everything up to the marker has been sent. This also holds
+    # when the snapshot named in the marker was deleted in the meantime.
     last_sent = read_marker(local_root)
-    already_sent = False
-    if last_sent is not None and last_sent in names:
-        already_sent = names.index(snapshot_name) <= names.index(last_sent)
+    already_sent = last_sent is not None and snapshot_name <= last_sent
 
     if not already_sent and not force:
         raise click.ClickException(
@@ -1172,14 +1822,29 @@ def delete_local(local_root: Path, snapshot_name: str, force: bool) -> None:
 
     if snapshot_name == last_sent:
         click.confirm(
-            f"{snapshot_name} is the parent for the next incremental send. Deleting it "
-            "means the next 'remote' run falls back to a full send. Continue?",
+            f"{snapshot_name} is the newest snapshot that is known to be on the remote. "
+            "Without it the next 'remote' run has to send against an older common snapshot, "
+            "or send everything again if there is none. Continue?",
             abort=True,
         )
 
     run(["btrfs", "subvolume", "delete", snap_dir / snapshot_name])
     click.echo(f"Deleted {snap_dir / snapshot_name}")
     update_current_link(local_root)
+
+
+@cli.command("delete-local")
+@local_root_option
+@click.argument("snapshot_name")
+@click.option("--force", is_flag=True, help="Delete even if not confirmed sent to the remote.")
+def delete_local(local_root: Path, snapshot_name: str, force: bool) -> None:
+    """Safely delete a local snapshot, refusing if it hasn't been sent to the remote yet.
+
+    Nothing is deleted while a 'local' or a 'remote' run is in progress.
+    """
+    require_root()
+    with exclusive_lock("local"), exclusive_lock("remote"):
+        perform_delete(local_root, snapshot_name, force)
 
 
 if __name__ == "__main__":

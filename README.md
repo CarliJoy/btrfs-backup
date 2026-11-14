@@ -43,13 +43,22 @@ SOURCE (ext4, e.g. encrypted NVMe)
    -> REMOTE (btrfs HDD)   btrfs send/receive (incremental)
 ```
 
-Every successful backup is a read-only snapshot `backup_<YYYYMMDD_HHMMSS>` in
-`<local-root>/.snapshots`, with a `backup.log` in its root. `<local-root>/current` always
+Every successful backup is a read-only snapshot `backup_<YYYYMMDD_HHMMSS>Z` in
+`<local-root>/.snapshots`, with a `backup.log` in its root.
+The time in the name and the times in the log are UTC, which the trailing `Z` marks.
+Snapshots from older versions (local time, no `Z`) keep their names and still sort correctly. `<local-root>/current` always
 points to the newest snapshot. Failed or killed runs stay behind as
 `.backup_inprogress_<time>` (with their log) and never block later runs.
 
 Nothing is deleted automatically. `delete-local` refuses to remove a snapshot that has not
 been sent to the remote disk yet.
+
+A lock in `/run/lock` keeps the same job from running twice at the same time.
+`delete-local` refuses to run while a `local` or a `remote` run is active.
+
+If rsync could not copy some files (exit code 23, for example an unreadable file), the
+snapshot is still created, the log ends with `OK WITH ERRORS`, and a warning is given.
+Any other rsync error fails the backup.
 
 ## Commands
 
@@ -62,6 +71,7 @@ been sent to the remote disk yet.
 | `delete-local`  | Delete a local snapshot, refusing if it was not sent to the remote   |
 | `install`       | Install the script to `/usr/local/sbin/btrfs-backup` via `sudo install` |
 | `install-timer` | Run the local backup once a day with a systemd timer                 |
+| `install-remote-trigger` | Send to the encrypted external disk when it is plugged in    |
 
 ### Default paths and the primary user
 
@@ -85,6 +95,18 @@ Every backup contains these files in `/root/backup-lists`, written before the co
 `huggingface-restore.sh` and `uv-tools-restore.sh`.
 The scripts only call the tools again, for example `uv tool install --with click ruff`.
 For `uv tool` the `--with` packages are kept, extras of the tool itself are not.
+A list or script is removed again when its tool is gone or has nothing to list.
+
+### Notifications
+
+`local --notify` and `remote --notify` show the result on the desktop of the primary user:
+a short notification with the duration on success, one that stays in the list for
+warnings, and a critical one that stays on screen until dismissed for failures.
+The units written by `install-timer` and `install-remote-trigger` use `--notify`.
+The script runs as root, so it starts `notify-send` inside the user's session with
+`systemd-run --machine=<USER>@.host --user`.
+If the user is not logged in, for example when a backup fails before the login, the
+notification is skipped, and the result is only in the journal and in `backup.log`.
 
 ### Running it automatically
 
@@ -114,6 +136,55 @@ there is none. The marker is updated after every snapshot, so an interrupted run
 where it stopped, and a partially received subvolume is removed again. Snapshots that are
 already complete on the remote disk are skipped, so deleting the marker file makes `remote`
 check all snapshots again.
+
+### Sending automatically when the external disk is plugged in
+
+The external disk is a LUKS partition with btrfs inside.
+`install-remote-trigger` takes the UUID of the LUKS partition, as plain UUID or as
+`/dev/disk/by-uuid/<UUID>` path.
+Find it with `sudo blkid -t TYPE=crypto_LUKS`.
+It is not the UUID of the btrfs filesystem inside.
+
+The unlock has to work without a prompt, so create a key file on the (encrypted) root disk
+and add it to the LUKS partition.
+Keep the passphrase slot, so you can still open the disk on another computer:
+
+```bash
+sudo dd if=/dev/urandom of=/root/.8tb.key bs=64 count=1
+sudo chmod 0400 /root/.8tb.key
+sudo cryptsetup luksAddKey /dev/disk/by-uuid/<LUKS-UUID> /root/.8tb.key
+```
+
+Then add one line each to `/etc/crypttab` and `/etc/fstab`.
+`noauto` keeps the boot from waiting for the disk, and `nofail` keeps a missing disk from
+being an error:
+
+```
+# /etc/crypttab
+8tb  UUID=<LUKS-UUID>  /root/.8tb.key  luks,noauto,nofail
+
+# /etc/fstab
+/dev/mapper/8tb  /media/<USER>/8tb  btrfs  noauto,nofail,noatime,compress=zstd:6  0  0
+```
+
+```bash
+sudo btrfs-backup install-remote-trigger <LUKS-UUID>
+```
+
+The command checks both files first: the crypttab entry exists and has a key file that
+exists and is not readable by others, `noauto` or `nofail` is set in both files, the fstab
+entry is btrfs, and `--remote-root` lies below its mount point.
+If something is wrong it lists all problems and installs nothing.
+The disk has to be connected, so that the command can verify that the UUID belongs to a
+LUKS partition.
+
+It then writes `btrfs-backup-remote.service`, started by systemd when the disk appears (no
+udev rule needed), and a drop-in for the local service that starts it after every successful
+local backup, but only if the disk is plugged in.
+The service unlocks and mounts the disk and runs `remote`.
+The disk stays mounted afterwards: unmount it yourself when the notification says it is done.
+It waits while a local backup is running, but never starts one.
+Test it with `sudo systemctl start btrfs-backup-remote.service`.
 
 ## Development
 
@@ -150,7 +221,8 @@ Run it again after every change to update the installed copy.
   `local --filter-file` selects another file).
 - Root for everything except `install`.
 - `btrfs-progs`, `rsync`; `runuser` (util-linux) and `uv` for the per-user lists;
-  `systemd` for `install-timer`.
+  `notify-send` (package `libnotify-bin`) for `--notify`;
+  `systemd` for `install-timer` and `install-remote-trigger`.
 
 ## Not done yet
 
